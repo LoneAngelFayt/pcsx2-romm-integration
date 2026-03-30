@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bash
+
+echo "[broker-mod] Checking for Python3..."
+
+if ! command -v python3 &> /dev/null; then
+    echo "[broker-mod] Python3 not found. Installing..."
+    apt-get update -qq && apt-get install -y -qq python3
+else
+    echo "[broker-mod] Python3 already installed: $(python3 --version)"
+fi
+
+echo "[broker-mod] Setting broker.py executable..."
+chmod +x /root/broker.py
+
+echo "[broker-mod] Starting broker.py..."
+exec python3 /root/broker.py
