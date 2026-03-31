@@ -61,47 +61,59 @@ def _launch_pcsx2(rom_path=None) -> None:
     Launch PCSX2 as abc user with Selkies joystick interposer.
     rom_path=None launches the dashboard (soft reset — keeps stream alive).
     """
-    time.sleep(3.0)
+    time.sleep(2.0)
 
-    subprocess.run(
-        "chmod 666 /tmp/selkies_js*.sock /tmp/selkies_event*.sock 2>/dev/null || true",
-        shell=True, check=False
+    log.info("Waiting for X display to be ready...")
+    for _ in range(30):
+        result = subprocess.run(
+            ["s6-setuidgid", "abc", "xset", "q"],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            log.info("X display is ready")
+            break
+        time.sleep(0.5)
+    else:
+        log.warning("X display did not become ready in time, attempting launch anyway")
+
+    subprocess.run(["chmod", "777"] + 
+        subprocess.run(["bash", "-c", "ls /tmp/selkies* 2>/dev/null"], 
+            capture_output=True, text=True).stdout.split(),
+        capture_output=True
     )
-
     subprocess.run(["chmod", "700", "/config/.XDG"], capture_output=True)
 
-    env_exports = " ".join([
-        f"DISPLAY={DISPLAY}",
-        "WAYLAND_DISPLAY=wayland-0",
-        "XDG_RUNTIME_DIR=/config/.XDG",
-        "XDG_CURRENT_DESKTOP=wlroots",
-        "HOME=/config",
-        "USER=abc",
-        "PATH=/command:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "LD_PRELOAD=/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
-        "PULSE_RUNTIME_PATH=/defaults",
-        "LANG=en_US.UTF-8",
-        "LANGUAGE=en_US.UTF-8",
-        "_JAVA_AWT_WM_NONREPARENTING=1",
-        "XCURSOR_SIZE=24",
-        "XCURSOR_THEME=breeze",
-        "TERM=foot",
-        "VIRTUAL_ENV=/lsiopy",
-        "PERL5LIB=/usr/local/bin",
-    ])
-
     if rom_path:
-        game_cmd = f"pcsx2-qt -batch -fullscreen -- '{rom_path}'"
+        game_cmd = ["/bin/bash", "-c", 
+            f"pcsx2-qt -batch -fullscreen -- '{rom_path}'"]
         log.info("Launching PCSX2 with ROM: %s", rom_path)
     else:
-        game_cmd = "pcsx2-qt"
+        game_cmd = ["/bin/bash", "-c", "pcsx2-qt"]
         log.info("Launching PCSX2 dashboard (soft reset)")
 
-    full_cmd = f"su abc -c 'env {env_exports} {game_cmd}'"
+    env = {
+        "DISPLAY": DISPLAY,
+        "WAYLAND_DISPLAY": "wayland-0",
+        "XDG_RUNTIME_DIR": "/config/.XDG",
+        "XDG_CURRENT_DESKTOP": "wlroots",
+        "HOME": "/config",
+        "USER": "abc",
+        "PATH": "/command:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+        "PULSE_RUNTIME_PATH": "/defaults",
+        "LANG": "en_US.UTF-8",
+        "LANGUAGE": "en_US.UTF-8",
+        "_JAVA_AWT_WM_NONREPARENTING": "1",
+        "XCURSOR_SIZE": "24",
+        "XCURSOR_THEME": "breeze",
+        "TERM": "foot",
+        "VIRTUAL_ENV": "/lsiopy",
+        "PERL5LIB": "/usr/local/bin",
+    }
 
     subprocess.Popen(
-        full_cmd,
-        shell=True,
+        ["s6-setuidgid", "abc"] + game_cmd,
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
