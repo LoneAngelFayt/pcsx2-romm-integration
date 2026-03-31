@@ -22,6 +22,6 @@ echo "[broker-mod] Patching PCSX2.ini..."
 sed -i 's/EnablePINE=false/EnablePINE=true/' "$INI"
 
 # Fix setup wizard blocking launch
-sed -i 's/SetupWizardIncomplete=true/SetupWizardIncomplete=false/' "$INI"
+# sed -i 's/SetupWizardIncomplete=true/SetupWizardIncomplete=false/' "$INI"
 
 echo "[broker-mod] PCSX2.ini patched — PINE enabled on slot 28011"

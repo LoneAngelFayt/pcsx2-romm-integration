@@ -84,6 +84,6 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:latest
-            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:v${{ steps.version.outputs.full }}
-            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:v${{ steps.version.outputs.minor }}
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:latest
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:v${{ steps.version.outputs.full }}
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:v${{ steps.version.outputs.minor }}
