@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 broker.py — ROM launch broker for linuxserver/pcsx2 container
-Drop into /config/broker.py inside the container.
 """
 
 import json
