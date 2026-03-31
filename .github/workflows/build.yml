@@ -1,12 +1,55 @@
-name: Build and Push Docker Mod
+name: Semantic Release & Docker Build
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches:
+      - main
 
 jobs:
-  build:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Semantic Release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/github
+
+      - name: Update Floating Tags (vX.Y & latest)
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: |
+          NEW_VER=${{ steps.semantic.outputs.new_release_version }}
+          MINOR_VER=$(echo $NEW_VER | cut -d. -f1-2)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -f v$MINOR_VER v$NEW_VER
+          git tag -f latest v$NEW_VER
+
+          git push origin v$MINOR_VER latest --force
+
+  docker:
+    needs: release
+    if: needs.release.outputs.new_release_published == 'true'
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -16,6 +59,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Lowercase repo owner
+        id: owner
+        run: echo "name=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -23,9 +70,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push
+      - name: Build and Push all tags
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/pcsx2-broker-mod:latest
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:latest
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:v${{ needs.release.outputs.new_release_version }}
+            ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-broker-mod:v${{ join(slice(split(needs.release.outputs.new_release_version, '.'), 0, 2), '.') }}
