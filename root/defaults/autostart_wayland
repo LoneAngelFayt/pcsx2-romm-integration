@@ -1,0 +1,3 @@
+#!/bin/bash
+# Run pcsx2 via broker launcher
+foot -e /root/pcsx2-launcher.sh
