@@ -61,48 +61,47 @@ def _launch_pcsx2(rom_path=None) -> None:
     Launch PCSX2 as abc user with Selkies joystick interposer.
     rom_path=None launches the dashboard (soft reset — keeps stream alive).
     """
-    time.sleep(1.0)
+    time.sleep(3.0)
+
     subprocess.run(
         "chmod 666 /tmp/selkies_js*.sock /tmp/selkies_event*.sock 2>/dev/null || true",
         shell=True, check=False
     )
 
-    pw = pwd.getpwnam("abc")
-    env = {
-        "DISPLAY": DISPLAY,
-        "WAYLAND_DISPLAY": "wayland-0",
-        "XDG_RUNTIME_DIR": "/config/.XDG",
-        "XDG_CURRENT_DESKTOP": "wlroots",
-        "HOME": "/config",
-        "USER": "abc",
-        "PATH": "/command:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
-        "PULSE_RUNTIME_PATH": "/defaults",
-        "LANG": "en_US.UTF-8",
-        "LANGUAGE": "en_US.UTF-8",
-        "_JAVA_AWT_WM_NONREPARENTING": "1",
-        "XCURSOR_SIZE": "24",
-        "XCURSOR_THEME": "breeze",
-        "TERM": "foot",
-        "VIRTUAL_ENV": "/lsiopy",
-        "PERL5LIB": "/usr/local/bin",
-    }
+    subprocess.run(["chmod", "700", "/config/.XDG"], capture_output=True)
+
+    env_exports = " ".join([
+        f"DISPLAY={DISPLAY}",
+        "WAYLAND_DISPLAY=wayland-0",
+        "XDG_RUNTIME_DIR=/config/.XDG",
+        "XDG_CURRENT_DESKTOP=wlroots",
+        "HOME=/config",
+        "USER=abc",
+        "PATH=/command:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LD_PRELOAD=/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+        "PULSE_RUNTIME_PATH=/defaults",
+        "LANG=en_US.UTF-8",
+        "LANGUAGE=en_US.UTF-8",
+        "_JAVA_AWT_WM_NONREPARENTING=1",
+        "XCURSOR_SIZE=24",
+        "XCURSOR_THEME=breeze",
+        "TERM=foot",
+        "VIRTUAL_ENV=/lsiopy",
+        "PERL5LIB=/usr/local/bin",
+    ])
 
     if rom_path:
-        cmd = ["pcsx2-qt", "-batch", "-fullscreen", "--", rom_path]
+        game_cmd = f"pcsx2-qt -batch -fullscreen -- '{rom_path}'"
         log.info("Launching PCSX2 with ROM: %s", rom_path)
     else:
-        cmd = ["pcsx2-qt"]
+        game_cmd = "pcsx2-qt"
         log.info("Launching PCSX2 dashboard (soft reset)")
 
-    def _drop_to_abc():
-        os.setgid(pw.pw_gid)
-        os.setuid(pw.pw_uid)
+    full_cmd = f"su abc -c 'env {env_exports} {game_cmd}'"
 
     subprocess.Popen(
-        cmd,
-        env=env,
-        preexec_fn=_drop_to_abc,
+        full_cmd,
+        shell=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
