@@ -6,7 +6,8 @@ broker.py — ROM launch broker for linuxserver/pcsx2 container
 import json
 import logging
 import os
-import pwd
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -34,7 +35,36 @@ _session: dict = {}
 
 # ── Process helpers ───────────────────────────────────────────────────────────
 
-ROM_FILE = "/tmp/pcsx2-rom"
+ROM_FILE   = "/tmp/pcsx2-rom"
+PINE_SOCK  = "/tmp/pcsx2.sock"
+PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
+
+# PINE IPC opcodes (PCSX2-Qt)
+_PINE_SAVE_STATE = 9
+
+
+def _pine_save_state() -> bool:
+    """Send a save-state command via PINE IPC. Returns True if the command was accepted."""
+    if not Path(PINE_SOCK).exists():
+        log.info("PINE socket not found — no game running, skipping save state")
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5.0)
+            s.connect(PINE_SOCK)
+            # Message: [u32 total_len][u8 opcode][u8 slot] — 6 bytes total
+            s.sendall(struct.pack("<IBB", 6, _PINE_SAVE_STATE, PINE_SAVE_SLOT))
+            resp = s.recv(5)  # [u32 total_len][u8 result]
+            if len(resp) >= 5:
+                result = struct.unpack("<IB", resp[:5])[1]
+                if result == 0:
+                    log.info("Save state queued for slot %d", PINE_SAVE_SLOT)
+                    return True
+                log.warning("PINE save state returned error code %d", result)
+    except Exception as exc:
+        log.warning("PINE save state failed: %s", exc)
+    return False
+
 
 def _kill_pcsx2() -> None:
     """Graceful shutdown — SIGTERM first, SIGKILL fallback."""
@@ -53,24 +83,6 @@ def _kill_pcsx2() -> None:
             subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
     except Exception as exc:
         log.warning("Error during PCSX2 shutdown: %s", exc)
-
-
-def _launch_pcsx2(rom_path=None) -> None:
-    """
-    Signal the launcher script by writing the ROM path to a file,
-    then kill PCSX2. The container's RESTART_APP watchdog or autostart
-    will relaunch it via pcsx2-launcher.sh which reads the file.
-    """
-    if rom_path:
-        Path(ROM_FILE).write_text(rom_path)
-        log.info("Wrote ROM path to launcher signal file: %s", rom_path)
-    else:
-        Path(ROM_FILE).unlink(missing_ok=True)
-        log.info("Cleared ROM signal — launcher will start dashboard")
-
-    # Small delay then kill — watchdog/autostart handles the relaunch
-    time.sleep(0.5)
-    _kill_pcsx2()
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -145,9 +157,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         def _do_launch():
+            Path(ROM_FILE).write_text(rom_path)
+            log.info("Wrote ROM path to launcher signal file: %s", rom_path)
             _kill_pcsx2()
-            time.sleep(1.0)
-            _launch_pcsx2(rom_path)
             _session.update({
                 "rom_path": rom_path,
                 "rom_name": rom_name,
@@ -171,12 +183,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         def _do_soft_reset():
-            log.info("Soft reset: stopping game, relaunching dashboard")
+            log.info("Release: saving state then stopping game")
+            if _pine_save_state():
+                log.info("Waiting for save state to complete...")
+                time.sleep(3.0)
+            Path(ROM_FILE).unlink(missing_ok=True)
             _kill_pcsx2()
-            time.sleep(1.0)
-            _launch_pcsx2(rom_path=None)
             _session.clear()
-            log.info("Soft reset complete")
+            log.info("Release complete — returned to dashboard")
 
         Thread(target=_do_soft_reset, daemon=True).start()
         self._send_json(200, {"status": "stopping"})
