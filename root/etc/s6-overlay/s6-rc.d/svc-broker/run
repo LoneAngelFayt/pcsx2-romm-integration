@@ -20,6 +20,10 @@ for i in $(seq 1 60); do
         # Fix BIOS path to absolute container path
         sed -i 's|Bios = ../../bios|Bios = /config/bios|' "$INI"
 
+        # Fix paths to absolute so PCSX2 finds saves/states regardless of CWD
+        sed -i 's|^Savestates = .*|Savestates = /config/.config/PCSX2/sstates|' "$INI"
+        sed -i 's|^MemoryCards = .*|MemoryCards = /config/.config/PCSX2/memcards|' "$INI"
+
         if ! grep -q "SDL-0" "$INI"; then
             sed -i '/^\[Pad1\]/a Type = DualShock2' "$INI"
         fi

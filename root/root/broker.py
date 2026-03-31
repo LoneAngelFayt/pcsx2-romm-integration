@@ -35,8 +35,9 @@ _session: dict = {}
 
 # ── Process helpers ───────────────────────────────────────────────────────────
 
-ROM_FILE   = "/tmp/pcsx2-rom"
-PINE_SOCK  = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
+ROM_FILE       = "/tmp/pcsx2-rom"
+SSTATES_DIR    = "/config/.config/PCSX2/sstates"
+PINE_SOCK      = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
 PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 
 # PINE IPC opcodes (PCSX2-Qt)
@@ -44,11 +45,14 @@ _PINE_SAVE_STATE = 9
 
 
 def _pine_save_state() -> bool:
-    """Send a save-state command via PINE IPC. Returns True if the command was accepted."""
+    """Send a save-state command via PINE IPC, then record the resulting .p2s path."""
     if not Path(PINE_SOCK).exists():
         log.info("PINE socket not found — no game running, skipping save state")
         return False
     try:
+        # Snapshot mtime of existing .p2s files before saving
+        before = {p: p.stat().st_mtime for p in Path(SSTATES_DIR).glob("*.p2s")} if Path(SSTATES_DIR).exists() else {}
+
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(5.0)
             s.connect(PINE_SOCK)
@@ -57,10 +61,25 @@ def _pine_save_state() -> bool:
             resp = s.recv(5)  # [u32 total_len][u8 result]
             if len(resp) >= 5:
                 result = struct.unpack("<IB", resp[:5])[1]
-                if result == 0:
-                    log.info("Save state queued for slot %d", PINE_SAVE_SLOT)
+                if result != 0:
+                    log.warning("PINE save state returned error code %d", result)
+                    return False
+
+        log.info("Save state queued for slot %d", PINE_SAVE_SLOT)
+
+        # Wait up to 5s for a new or updated .p2s file to appear
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            for p in Path(SSTATES_DIR).glob("*.p2s"):
+                if p not in before or p.stat().st_mtime > before.get(p, 0):
+                    Path(STATE_FILE).write_text(str(p))
+                    log.info("Save state written: %s", p)
                     return True
-                log.warning("PINE save state returned error code %d", result)
+
+        log.warning("Save state file did not appear within timeout")
+        return True  # command was accepted, file may still be writing
+
     except Exception as exc:
         log.warning("PINE save state failed: %s", exc)
     return False
@@ -184,9 +203,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         def _do_soft_reset():
             log.info("Release: saving state then stopping game")
-            if _pine_save_state():
-                log.info("Waiting for save state to complete...")
-                time.sleep(3.0)
+            _pine_save_state()
             Path(ROM_FILE).unlink(missing_ok=True)
             _kill_pcsx2()
             _session.clear()
