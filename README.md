@@ -1,4 +1,4 @@
-# pcsx2-broker-mod
+# pcsx2-romm-integration-mod
 
 A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that installs and runs `broker.py` inside the [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) container for RomM integration.
 
@@ -27,7 +27,7 @@ On every container start, this mod:
 
 Add the `DOCKER_MODS` environment variable to your PCSX2 container:
 ```yaml
-    - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
+    - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
 ```
 
 Then recreate the container:
@@ -57,7 +57,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Chicago
-      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
+      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
       - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
     ports:
       - 8000:8000   # broker API
@@ -120,8 +120,10 @@ X-Broker-Secret: your_secret_here
 |---|---|---|---|
 | `BROKER_SECRET` | Recommended | *(none)* | Shared secret for authenticating launch requests. Sent as the `X-Broker-Secret` header. If unset, the broker accepts unauthenticated requests from anyone with network access. |
 | `BROKER_PORT` | No | `8000` | Port the broker HTTP server listens on. Only set this if `8000` conflicts with another service. |
-| `DISPLAY` | No | :1 | X display to launch PCSX2 on. |
-| `RESTART_APP` | Yes | false | Restarts PCSX2 in the container when broker writes the rom path. |
+| `DISPLAY` | No | :0 | X display to launch PCSX2 on. |
+| `BROKER_SAVE_SLOT` | No | 0 | Allows for overwritting the save slot for auto save state on exit. | i 
+
+
 
 ### Recommended `docker-compose.yml`
 ```yaml
@@ -134,7 +136,7 @@ services:
       - PGID=1000
       - TZ=America/Chicago
       - RESTART_APP=true
-      - DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:latest
+      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
       - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
     ports:
       - 8000:8000   # broker API
@@ -196,16 +198,16 @@ X-Broker-Secret: your_secret_here
 By default `:latest` always pulls the newest release. If you want a stable pin that never changes:
 ```yaml
 # Pinned to exact version — never changes
-- DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:v1.0.0
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:v1.0.0
 
 # Pinned to minor — gets patches but not breaking changes
-- DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:v1.0
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:v1.0
 
 # Always latest release
-- DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:latest
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
 ```
 
-Available versions can be found on the [Packages page](https://github.com/LoneAngelFayt/pcsx2-broker-mod/pkgs/container/pcsx2-broker-mod).
+Available versions can be found on the [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-integration-mod/pkgs/container/pcsx2-romm-integration-mod).
 
 ---
 
