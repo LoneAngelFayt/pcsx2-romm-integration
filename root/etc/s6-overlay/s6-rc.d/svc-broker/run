@@ -35,5 +35,19 @@ echo "[broker-mod] Setting broker.py and launcher executable..."
 chmod +x /root/broker.py
 chmod 755 /usr/local/bin/pcsx2-launcher.sh
 
+echo "[broker-mod] Writing labwc autostart..."
+AUTOSTART="/config/.config/labwc/autostart"
+mkdir -p "$(dirname "$AUTOSTART")"
+cat > "$AUTOSTART" << 'AUTOSTART_EOF'
+#!/bin/bash
+export WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR=/config/.XDG
+while true; do
+    foot -e /usr/local/bin/pcsx2-launcher.sh
+    sleep 1
+done
+AUTOSTART_EOF
+chmod +x "$AUTOSTART"
+
 echo "[broker-mod] Starting broker.py..."
 exec python3 -u /root/broker.py
