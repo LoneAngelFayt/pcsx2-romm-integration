@@ -8,6 +8,13 @@ else
     echo "[broker-mod] Python3 already installed: $(python3 --version)"
 fi
 
+echo "[broker-mod] Symlinking BIOS directory..."
+# PCSX2 defaults to /config/.config/PCSX2/bios but compose mounts BIOS at /config/bios
+mkdir -p /config/.config/PCSX2
+if [ ! -e /config/.config/PCSX2/bios ]; then
+    ln -s /config/bios /config/.config/PCSX2/bios
+fi
+
 echo "[broker-mod] Waiting for PCSX2.ini..."
 INI="/config/.config/PCSX2/inis/PCSX2.ini"
 for i in $(seq 1 60); do
