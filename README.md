@@ -27,16 +27,7 @@ On every container start, this mod:
 
 Add the `DOCKER_MODS` environment variable to your PCSX2 container:
 ```yaml
-services:
-  pcsx2:
-    image: lscr.io/linuxserver/pcsx2:latest
-    container_name: pcsx2
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Chicago
-      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
-    # ... rest of your config
+    - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
 ```
 
 Then recreate the container:
@@ -66,7 +57,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Chicago
-      - DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:latest
+      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
       - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
     ports:
       - 8000:8000   # broker API
