@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""
-broker.py — ROM launch broker for linuxserver/pcsx2 container
-"""
+# ROM launch broker for the linuxserver/pcsx2 Docker mod.
+# Accepts HTTP requests from RomM to launch/stop games and save state on release.
 
 import json
 import logging
@@ -40,23 +39,23 @@ SSTATES_DIR    = "/config/.config/PCSX2/sstates"
 PINE_SOCK      = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
 PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 
-# PINE IPC opcodes (PCSX2-Qt)
+# PINE save state opcode for PCSX2-Qt
 _PINE_SAVE_STATE = 9
 
 
 def _pine_save_state() -> bool:
-    """Send a save-state command via PINE IPC, then record the resulting .p2s path."""
+    """Trigger a save state via PINE IPC and wait for the .p2s file to be written."""
     if not Path(PINE_SOCK).exists():
         log.info("PINE socket not found — no game running, skipping save state")
         return False
     try:
-        # Snapshot mtime of existing .p2s files before saving
+        # Record mtimes before saving so we can detect when the file is written
         before = {p: p.stat().st_mtime for p in Path(SSTATES_DIR).glob("*.p2s")} if Path(SSTATES_DIR).exists() else {}
 
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(5.0)
             s.connect(PINE_SOCK)
-            # Message: [u32 total_len][u8 opcode][u8 slot] — 6 bytes total
+            # [u32 total_len][u8 opcode][u8 slot] — 6 bytes
             s.sendall(struct.pack("<IBB", 6, _PINE_SAVE_STATE, PINE_SAVE_SLOT))
             resp = s.recv(5)  # [u32 total_len][u8 result]
             if len(resp) >= 5:
@@ -67,18 +66,17 @@ def _pine_save_state() -> bool:
 
         log.info("Save state queued for slot %d", PINE_SAVE_SLOT)
 
-        # Wait up to 5s for a new or updated .p2s file to appear
+        # Poll up to 5s for the .p2s file to appear or update
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             time.sleep(0.25)
             for p in Path(SSTATES_DIR).glob("*.p2s"):
                 if p not in before or p.stat().st_mtime > before.get(p, 0):
-                    Path(STATE_FILE).write_text(str(p))
                     log.info("Save state written: %s", p)
                     return True
 
         log.warning("Save state file did not appear within timeout")
-        return True  # command was accepted, file may still be writing
+        return True  # IPC command accepted; write may still be in progress
 
     except Exception as exc:
         log.warning("PINE save state failed: %s", exc)
@@ -86,7 +84,7 @@ def _pine_save_state() -> bool:
 
 
 def _kill_pcsx2() -> None:
-    """Graceful shutdown — SIGTERM first, SIGKILL fallback."""
+    """SIGTERM with 8s grace period, SIGKILL if it doesn't exit."""
     try:
         if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode == 0:
             log.info("Requesting graceful stop (SIGTERM) for PCSX2...")

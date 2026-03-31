@@ -20,7 +20,7 @@ for i in $(seq 1 60); do
         # Fix BIOS path to absolute container path
         sed -i 's|Bios = ../../bios|Bios = /config/bios|' "$INI"
 
-        # Fix paths to absolute so PCSX2 finds saves/states regardless of CWD
+        # PCSX2 writes relative paths here on exit; pin them to absolute
         sed -i 's|^Savestates = .*|Savestates = /config/.config/PCSX2/sstates|' "$INI"
         sed -i 's|^MemoryCards = .*|MemoryCards = /config/.config/PCSX2/memcards|' "$INI"
 
@@ -47,6 +47,18 @@ AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
 cat > "$AUTOSTART" << 'AUTOSTART_EOF'
 #!/bin/bash
+PIDFILE=/tmp/pcsx2-autostart.pid
+
+# Kill any orphaned autostart loop left over from a previous labwc session
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null
+        pkill -P "$OLD_PID" 2>/dev/null
+    fi
+fi
+echo $$ > "$PIDFILE"
+
 export WAYLAND_DISPLAY=wayland-1
 export XDG_RUNTIME_DIR=/config/.XDG
 while true; do

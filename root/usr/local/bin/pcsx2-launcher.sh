@@ -7,7 +7,7 @@ export QT_QPA_PLATFORM=xcb
 ROM_FILE="/tmp/pcsx2-rom"
 INI="/config/.config/PCSX2/inis/PCSX2.ini"
 
-# Re-patch settings each launch since PCSX2 resets them on exit
+# PCSX2 rewrites the INI on exit, reverting these — re-apply each launch
 if [ -f "$INI" ]; then
     sed -i 's/EnablePINE = false/EnablePINE = true/' "$INI"
     sed -i 's|^Savestates = .*|Savestates = /config/.config/PCSX2/sstates|' "$INI"
