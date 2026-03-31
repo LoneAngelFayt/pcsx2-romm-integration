@@ -1,13 +1,30 @@
 #!/usr/bin/with-contenv bash
 
 echo "[broker-mod] Checking for Python3..."
-
 if ! command -v python3 &> /dev/null; then
     echo "[broker-mod] Python3 not found. Installing..."
     apt-get update -qq && apt-get install -y -qq python3
 else
     echo "[broker-mod] Python3 already installed: $(python3 --version)"
 fi
+
+echo "[broker-mod] Waiting for PCSX2.ini..."
+INI="/config/.config/PCSX2/inis/PCSX2.ini"
+for i in $(seq 1 60); do
+    if [ -f "$INI" ]; then
+        echo "[broker-mod] Patching PCSX2.ini..."
+
+        # Enable PINE IPC — required for RomM broker integration
+        sed -i 's/EnablePINE=false/EnablePINE=true/' "$INI"
+
+        # Pre-set BIOS folder path so wizard finds BIOS files automatically
+        sed -i 's|^Bios = .*|Bios = /config/bios|' "$INI"
+
+        echo "[broker-mod] PCSX2.ini patched — PINE enabled, BIOS path set to /config/bios"
+        break
+    fi
+    sleep 2
+done
 
 echo "[broker-mod] Setting broker.py executable..."
 chmod +x /root/broker.py
