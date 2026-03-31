@@ -1,0 +1,2 @@
+#!/usr/bin/with-contenv bash
+echo "[broker-mod] broker.py exited with code $1 — s6 will restart it"
