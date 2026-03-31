@@ -13,4 +13,4 @@ echo "[broker-mod] Setting broker.py executable..."
 chmod +x /root/broker.py
 
 echo "[broker-mod] Starting broker.py..."
-exec python3 /root/broker.py
+exec python3 -u /root/broker.py
