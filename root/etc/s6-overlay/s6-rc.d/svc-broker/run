@@ -26,15 +26,11 @@ for i in $(seq 1 60); do
         sed -i 's/EnablePINE = false/EnablePINE = true/' "$INI"
 
         # Fix BIOS path to absolute container path
-        sed -i 's|Bios = ../../bios|Bios = /config/bios|' "$INI"
+        sed -i 's|^Bios = .*|Bios = /config/bios|' "$INI"
 
         # PCSX2 writes relative paths here on exit; pin them to absolute
         sed -i 's|^Savestates = .*|Savestates = /config/.config/PCSX2/sstates|' "$INI"
         sed -i 's|^MemoryCards = .*|MemoryCards = /config/.config/PCSX2/memcards|' "$INI"
-
-        if ! grep -q "SDL-0" "$INI"; then
-            sed -i '/^\[Pad1\]/a Type = DualShock2' "$INI"
-        fi
 
         echo "[broker-mod] PCSX2.ini patched:"
         grep -E "EnablePINE|Bios " "$INI"
