@@ -17,10 +17,7 @@ from threading import Thread
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PORT    = int(os.environ.get("BROKER_PORT", "8000"))
-DISPLAY = os.environ.get("DISPLAY") or subprocess.run(
-    ["bash", "-c", "ls /tmp/.X11-unix/ | head -1 | sed 's/X/:/'" ],
-    capture_output=True, text=True
-).stdout.strip() or ":0"
+DISPLAY = os.environ.get("DISPLAY", ":1")
 SECRET  = os.environ.get("BROKER_SECRET", "")
 
 logging.basicConfig(
@@ -37,8 +34,10 @@ _session: dict = {}
 
 # ── Process helpers ───────────────────────────────────────────────────────────
 
+ROM_FILE = "/tmp/pcsx2-rom"
+
 def _kill_pcsx2() -> None:
-    """Graceful shutdown — SIGTERM first so PCSX2 can auto-save, SIGKILL fallback."""
+    """Graceful shutdown — SIGTERM first, SIGKILL fallback."""
     try:
         if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode == 0:
             log.info("Requesting graceful stop (SIGTERM) for PCSX2...")
@@ -58,65 +57,20 @@ def _kill_pcsx2() -> None:
 
 def _launch_pcsx2(rom_path=None) -> None:
     """
-    Launch PCSX2 as abc user with Selkies joystick interposer.
-    rom_path=None launches the dashboard (soft reset — keeps stream alive).
+    Signal the launcher script by writing the ROM path to a file,
+    then kill PCSX2. The container's RESTART_APP watchdog or autostart
+    will relaunch it via pcsx2-launcher.sh which reads the file.
     """
-    time.sleep(2.0)
-
-    log.info("Waiting for X display to be ready...")
-    for _ in range(30):
-        result = subprocess.run(
-            ["s6-setuidgid", "abc", "xset", "q"],
-            capture_output=True
-        )
-        if result.returncode == 0:
-            log.info("X display is ready")
-            break
-        time.sleep(0.5)
-    else:
-        log.warning("X display did not become ready in time, attempting launch anyway")
-
-    subprocess.run(["chmod", "777"] + 
-        subprocess.run(["bash", "-c", "ls /tmp/selkies* 2>/dev/null"], 
-            capture_output=True, text=True).stdout.split(),
-        capture_output=True
-    )
-    subprocess.run(["chmod", "700", "/config/.XDG"], capture_output=True)
-
     if rom_path:
-        game_cmd = ["/bin/bash", "-c", 
-            f"pcsx2-qt -batch -fullscreen -- '{rom_path}'"]
-        log.info("Launching PCSX2 with ROM: %s", rom_path)
+        Path(ROM_FILE).write_text(rom_path)
+        log.info("Wrote ROM path to launcher signal file: %s", rom_path)
     else:
-        game_cmd = ["/bin/bash", "-c", "pcsx2-qt"]
-        log.info("Launching PCSX2 dashboard (soft reset)")
+        Path(ROM_FILE).unlink(missing_ok=True)
+        log.info("Cleared ROM signal — launcher will start dashboard")
 
-    env = {
-        "DISPLAY": DISPLAY,
-        "WAYLAND_DISPLAY": "wayland-0",
-        "XDG_RUNTIME_DIR": "/config/.XDG",
-        "XDG_CURRENT_DESKTOP": "wlroots",
-        "HOME": "/config",
-        "USER": "abc",
-        "PATH": "/command:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
-        "PULSE_RUNTIME_PATH": "/defaults",
-        "LANG": "en_US.UTF-8",
-        "LANGUAGE": "en_US.UTF-8",
-        "_JAVA_AWT_WM_NONREPARENTING": "1",
-        "XCURSOR_SIZE": "24",
-        "XCURSOR_THEME": "breeze",
-        "TERM": "foot",
-        "VIRTUAL_ENV": "/lsiopy",
-        "PERL5LIB": "/usr/local/bin",
-    }
-
-    subprocess.Popen(
-        ["s6-setuidgid", "abc"] + game_cmd,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # Small delay then kill — watchdog/autostart handles the relaunch
+    time.sleep(0.5)
+    _kill_pcsx2()
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────

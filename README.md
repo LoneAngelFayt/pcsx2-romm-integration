@@ -120,7 +120,8 @@ X-Broker-Secret: your_secret_here
 |---|---|---|---|
 | `BROKER_SECRET` | Recommended | *(none)* | Shared secret for authenticating launch requests. Sent as the `X-Broker-Secret` header. If unset, the broker accepts unauthenticated requests from anyone with network access. |
 | `BROKER_PORT` | No | `8000` | Port the broker HTTP server listens on. Only set this if `8000` conflicts with another service. |
-| `DISPLAY` | No | Auto-detected | X display to launch PCSX2 on. Auto-detected from `/tmp/.X11-unix/` — only override if auto-detection fails. |
+| `DISPLAY` | No | :1 | X display to launch PCSX2 on. |
+| `RESTART_APP` | Yes | false | Restarts PCSX2 in the container when broker writes the rom path. |
 
 ### Recommended `docker-compose.yml`
 ```yaml
@@ -132,6 +133,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Chicago
+      - RESTART_APP=true
       - DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:latest
       - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
     ports:
