@@ -31,8 +31,9 @@ for i in $(seq 1 60); do
     sleep 2
 done
 
-echo "[broker-mod] Setting broker.py executable..."
+echo "[broker-mod] Setting broker.py and launcher executable..."
 chmod +x /root/broker.py
+chmod 755 /usr/local/bin/pcsx2-launcher.sh
 
 echo "[broker-mod] Starting broker.py..."
 exec python3 -u /root/broker.py
