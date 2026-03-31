@@ -114,6 +114,81 @@ X-Broker-Secret: your_secret_here
 ```
 
 
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `BROKER_SECRET` | Recommended | *(none)* | Shared secret for authenticating launch requests. Sent as the `X-Broker-Secret` header. If unset, the broker accepts unauthenticated requests from anyone with network access. |
+| `BROKER_PORT` | No | `8000` | Port the broker HTTP server listens on. Only set this if `8000` conflicts with another service. |
+| `DISPLAY` | No | Auto-detected | X display to launch PCSX2 on. Auto-detected from `/tmp/.X11-unix/` — only override if auto-detection fails. |
+
+### Recommended `docker-compose.yml`
+```yaml
+services:
+  pcsx2:
+    image: lscr.io/linuxserver/pcsx2:latest
+    container_name: pcsx2
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Chicago
+      - DOCKER_MODS=ghcr.io/loneangelfahyt/pcsx2-broker-mod:latest
+      - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
+    ports:
+      - 8000:8000   # broker API
+    # ... rest of your config
+```
+
+> **Note:** `BROKER_SECRET` is optional but strongly recommended. Without it, anyone on your network can send launch commands to the broker.
+
+---
+
+## API Reference
+
+The broker exposes a small HTTP API on `BROKER_PORT`.
+
+### `GET /health`
+Returns `200 OK` if the broker is running.
+
+### `GET /status`
+Returns the currently active session, or `{"active": false}` if idle.
+```json
+{
+  "active": true,
+  "rom_path": "/data/roms/ps2/game.iso",
+  "rom_name": "game",
+  "started_at": "2024-01-01T00:00:00Z"
+}
+```
+
+### `POST /launch`
+Kills any running game and launches a new ROM.
+
+**Headers:**
+```
+Content-Type: application/json
+X-Broker-Secret: your_secret_here
+```
+
+**Body:**
+```json
+{
+  "rom_path": "/data/roms/ps2/game.iso",
+  "rom_name": "Game Title"
+}
+```
+
+> `rom_path` must be the path **inside the container**. Make sure your ROMs volume is mounted at the same path in both the PCSX2 container and whatever is calling the broker (e.g. RomM).
+
+### `DELETE /launch`
+Stops the current game and returns PCSX2 to the dashboard.
+
+**Headers:**
+```
+X-Broker-Secret: your_secret_here
+```
+
+
 ## Pinning to a Specific Version
 
 By default `:latest` always pulls the newest release. If you want a stable pin that never changes:
