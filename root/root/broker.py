@@ -36,7 +36,7 @@ _session: dict = {}
 # ── Process helpers ───────────────────────────────────────────────────────────
 
 ROM_FILE   = "/tmp/pcsx2-rom"
-PINE_SOCK  = "/tmp/pcsx2.sock"
+PINE_SOCK  = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
 PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 
 # PINE IPC opcodes (PCSX2-Qt)
