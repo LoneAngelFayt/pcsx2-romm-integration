@@ -281,6 +281,23 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "saving", "slot": slot})
             return
 
+        if self.path == "/restart":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if not _session:
+                self._send_json(409, {"error": "no active session"})
+                return
+            rom_path = _session.get("rom_path")
+            def _do_restart(rom_path=rom_path):
+                log.info("Restart: killing PCSX2 and relaunching %s", rom_path)
+                _kill_pcsx2()
+                Path(ROM_FILE).write_text(rom_path)
+                log.info("Restart: launcher signal written")
+            Thread(target=_do_restart, daemon=True).start()
+            self._send_json(200, {"status": "restarting", "rom_path": rom_path})
+            return
+
         if self.path == "/volume":
             if not self._check_secret():
                 self._send_json(403, {"error": "forbidden"})
