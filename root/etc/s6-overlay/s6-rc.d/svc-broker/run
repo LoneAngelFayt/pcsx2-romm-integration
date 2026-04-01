@@ -1,4 +1,5 @@
 #!/usr/bin/with-contenv bash
+# Runs as root intentionally — needs to chmod/chown config dirs and manage system processes.
 
 echo "[broker-mod] Checking for Python3..."
 if ! command -v python3 &> /dev/null; then

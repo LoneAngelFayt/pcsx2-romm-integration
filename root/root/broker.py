@@ -278,6 +278,10 @@ def main():
     else:
         log.warning("No BROKER_SECRET set — unauthenticated access allowed")
 
+    bios_dir = Path("/config/bios")
+    if not bios_dir.exists() or not any(bios_dir.iterdir()):
+        log.warning("No BIOS files found at /config/bios — PCSX2 will not run games until a PS2 BIOS is mounted there")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
