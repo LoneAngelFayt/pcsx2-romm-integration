@@ -50,6 +50,12 @@ echo "[broker-mod] Setting broker.py and launcher executable..."
 chmod +x /root/broker.py
 chmod 755 /usr/local/bin/pcsx2-launcher.sh
 
+# cleanup orphaned signal files from previous runs to prevent loops
+if [ -f "/tmp/pcsx2-rom" ]; then
+    echo "[broker-mod] Cleaning up orphaned signal file /tmp/pcsx2-rom..."
+    rm -f /tmp/pcsx2-rom
+fi
+
 echo "[broker-mod] Writing labwc autostart..."
 AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
