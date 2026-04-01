@@ -73,11 +73,11 @@ if [ -f "$ROM_FILE" ]; then
     fi
     rm -f "$ROM_FILE"
     echo "[pcsx2-launcher] Exec: pcsx2-qt -batch '$ROM_PATH'"
-    pcsx2-qt -batch "$ROM_PATH"
-    EXIT_CODE=$?
+    pcsx2-qt -batch "$ROM_PATH" 2>&1 | grep -v "XKB" # pipe output to log but filter X11 noise
+    EXIT_CODE=${PIPESTATUS[0]}
     echo "[pcsx2-launcher] pcsx2-qt exited with code $EXIT_CODE"
     exit $EXIT_CODE
 else
     echo "[pcsx2-launcher] No ROM signal — launching dashboard"
-    exec pcsx2-qt
+    exec pcsx2-qt 2>&1
 fi
