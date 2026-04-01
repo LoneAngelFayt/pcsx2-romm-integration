@@ -9,14 +9,6 @@ else
     echo "[broker-mod] Python3 already installed: $(python3 --version)"
 fi
 
-echo "[broker-mod] Symlinking BIOS directory..."
-# PCSX2 defaults to /config/.config/PCSX2/bios but compose mounts BIOS at /config/bios
-mkdir -p /config/.config/PCSX2
-chown abc:abc /config/.config /config/.config/PCSX2
-if [ ! -e /config/.config/PCSX2/bios ]; then
-    ln -s /config/bios /config/.config/PCSX2/bios
-fi
-
 INI="/config/.config/PCSX2/inis/PCSX2.ini"
 if [ -f "$INI" ]; then
     echo "[broker-mod] Existing config found — applying patches..."
@@ -53,9 +45,6 @@ done
 if (( INI_FOUND == 0 )); then
     echo "[broker-mod] WARNING: PCSX2.ini never appeared — PINE IPC will not be enabled until next restart"
 fi
-
-echo "[broker-mod] Fixing XDG_RUNTIME_DIR permissions..."
-chmod 700 /config/.XDG
 
 echo "[broker-mod] Setting broker.py and launcher executable..."
 chmod +x /root/broker.py

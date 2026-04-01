@@ -1,0 +1,17 @@
+#!/usr/bin/with-contenv bash
+# Runs before any services (including svc-de/PCSX2) to ensure config dirs
+# exist and are writable by abc before PCSX2 tries to create them.
+
+echo "[broker-mod] Creating PCSX2 config directories..."
+mkdir -p /config/.config/PCSX2
+chown abc:abc /config/.config /config/.config/PCSX2
+
+echo "[broker-mod] Symlinking BIOS directory..."
+# PCSX2 defaults to /config/.config/PCSX2/bios but compose mounts BIOS at /config/bios
+if [ ! -e /config/.config/PCSX2/bios ]; then
+    ln -s /config/bios /config/.config/PCSX2/bios
+fi
+
+echo "[broker-mod] Fixing XDG_RUNTIME_DIR permissions..."
+mkdir -p /config/.XDG
+chmod 700 /config/.XDG
