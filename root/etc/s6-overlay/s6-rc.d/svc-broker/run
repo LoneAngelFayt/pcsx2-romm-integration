@@ -17,11 +17,18 @@ if [ ! -e /config/.config/PCSX2/bios ]; then
     ln -s /config/bios /config/.config/PCSX2/bios
 fi
 
-echo "[broker-mod] Waiting for PCSX2.ini..."
 INI="/config/.config/PCSX2/inis/PCSX2.ini"
-for i in $(seq 1 60); do
+if [ -f "$INI" ]; then
+    echo "[broker-mod] Existing config found — applying patches..."
+else
+    echo "[broker-mod] First run detected — waiting for setup wizard to complete (up to 60s)..."
+fi
+
+INI_FOUND=0
+for i in $(seq 1 120); do
     if [ -f "$INI" ]; then
-        echo "[broker-mod] Patching PCSX2.ini..."
+        INI_FOUND=1
+        echo "[broker-mod] PCSX2.ini found after $((i / 2))s — patching..."
 
         # Enable PINE IPC
         sed -i 's/EnablePINE = false/EnablePINE = true/' "$INI"
@@ -37,8 +44,15 @@ for i in $(seq 1 60); do
         grep -E "EnablePINE|Bios " "$INI"
         break
     fi
-    sleep 2
+    # Log progress every 5 seconds
+    if (( i % 10 == 0 )); then
+        echo "[broker-mod] Still waiting for PCSX2.ini... ($((i / 2))s elapsed)"
+    fi
+    sleep 0.5
 done
+if (( INI_FOUND == 0 )); then
+    echo "[broker-mod] WARNING: PCSX2.ini never appeared — PINE IPC will not be enabled until next restart"
+fi
 
 echo "[broker-mod] Fixing XDG_RUNTIME_DIR permissions..."
 chmod 700 /config/.XDG
