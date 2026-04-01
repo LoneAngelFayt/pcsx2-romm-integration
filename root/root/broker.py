@@ -128,6 +128,37 @@ def _take_screenshot() -> bool:
     return False
 
 
+def _set_volume(level: int) -> bool:
+    """Set PCSX2's PulseAudio sink input volume. level is 0–100."""
+    level = max(0, min(100, level))
+    try:
+        # Find the sink input index owned by the pcsx2-qt process
+        result = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True)
+        sink_input = None
+        current_index = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Sink Input #"):
+                current_index = line.split("#")[1]
+            elif "application.process.binary" in line and "pcsx2-qt" in line:
+                sink_input = current_index
+                break
+
+        if sink_input is None:
+            log.warning("Could not find PCSX2 sink input — is audio running?")
+            return False
+
+        subprocess.run(
+            ["pactl", "set-sink-input-volume", sink_input, f"{level}%"],
+            capture_output=True, check=True,
+        )
+        log.info("Volume set to %d%% (sink input %s)", level, sink_input)
+        return True
+    except Exception as exc:
+        log.warning("Volume set failed: %s", exc)
+    return False
+
+
 def _kill_pcsx2() -> None:
     """SIGTERM with 8s grace period, SIGKILL if it doesn't exit."""
     try:
@@ -248,6 +279,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 log.info("Manual save state slot %d %s", slot, "succeeded" if ok else "failed")
             Thread(target=_do_save, daemon=True).start()
             self._send_json(200, {"status": "saving", "slot": slot})
+            return
+
+        if self.path == "/volume":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            body = self._read_body()
+            if "level" not in body:
+                self._send_json(400, {"error": "level is required (0–100)"})
+                return
+            level = int(body["level"])
+            ok = _set_volume(level)
+            self._send_json(200 if ok else 502, {"status": "ok" if ok else "failed", "level": level})
             return
 
         if self.path == "/screenshot":
