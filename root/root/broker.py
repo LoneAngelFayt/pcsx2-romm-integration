@@ -12,13 +12,14 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PORT    = int(os.environ.get("BROKER_PORT", "8000"))
-DISPLAY = os.environ.get("DISPLAY", ":1")
-SECRET  = os.environ.get("BROKER_SECRET", "")
+PORT               = int(os.environ.get("BROKER_PORT", "8000"))
+DISPLAY            = os.environ.get("DISPLAY", ":1")
+SECRET             = os.environ.get("BROKER_SECRET", "")
+HEARTBEAT_TIMEOUT  = int(os.environ.get("BROKER_HEARTBEAT_TIMEOUT", "120"))  # seconds; 0 = disabled
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +32,8 @@ log = logging.getLogger("broker")
 # ── Session state ─────────────────────────────────────────────────────────────
 
 _session: dict = {}
+_heartbeat_lock = Lock()
+_last_heartbeat: float = 0.0  # monotonic timestamp of last heartbeat; 0 = no active session
 
 # ── Process helpers ───────────────────────────────────────────────────────────
 
@@ -102,6 +105,33 @@ def _kill_pcsx2() -> None:
         log.warning("Error during PCSX2 shutdown: %s", exc)
 
 
+# ── Heartbeat monitor ────────────────────────────────────────────────────────
+
+def _release_session():
+    """Save state and return to dashboard. Shared by DELETE /launch and heartbeat timeout."""
+    global _last_heartbeat
+    _pine_save_state()
+    Path(ROM_FILE).unlink(missing_ok=True)
+    _kill_pcsx2()
+    _session.clear()
+    with _heartbeat_lock:
+        _last_heartbeat = 0.0
+
+
+def _heartbeat_monitor():
+    """Background thread: auto-release if no heartbeat received within HEARTBEAT_TIMEOUT seconds."""
+    while True:
+        time.sleep(10)
+        if HEARTBEAT_TIMEOUT <= 0 or not _session:
+            continue
+        with _heartbeat_lock:
+            last = _last_heartbeat
+        if last > 0 and time.monotonic() - last > HEARTBEAT_TIMEOUT:
+            log.warning("Heartbeat timeout (%ds) — auto-releasing session", HEARTBEAT_TIMEOUT)
+            _release_session()
+            log.info("Auto-release complete")
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -149,6 +179,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/heartbeat":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if _session:
+                global _last_heartbeat
+                with _heartbeat_lock:
+                    _last_heartbeat = time.monotonic()
+                self._send_json(200, {"status": "ok"})
+            else:
+                self._send_json(200, {"status": "no_session"})
+            return
+
         if self.path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
@@ -174,6 +217,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         def _do_launch():
+            global _last_heartbeat
             Path(ROM_FILE).write_text(rom_path)
             log.info("Wrote ROM path to launcher signal file: %s", rom_path)
             _kill_pcsx2()
@@ -182,6 +226,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "rom_name": rom_name,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             })
+            with _heartbeat_lock:
+                _last_heartbeat = time.monotonic()
             log.info("Session started: %s", rom_name)
 
         Thread(target=_do_launch, daemon=True).start()
@@ -201,10 +247,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         def _do_soft_reset():
             log.info("Release: saving state then stopping game")
-            _pine_save_state()
-            Path(ROM_FILE).unlink(missing_ok=True)
-            _kill_pcsx2()
-            _session.clear()
+            _release_session()
             log.info("Release complete — returned to dashboard")
 
         Thread(target=_do_soft_reset, daemon=True).start()
@@ -221,9 +264,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    Thread(target=_heartbeat_monitor, daemon=True).start()
+
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
     log.info("DISPLAY=%s", DISPLAY)
+    if HEARTBEAT_TIMEOUT > 0:
+        log.info("Heartbeat timeout: %ds", HEARTBEAT_TIMEOUT)
+    else:
+        log.info("Heartbeat timeout disabled")
     if SECRET:
         log.info("Shared secret auth enabled")
     else:
