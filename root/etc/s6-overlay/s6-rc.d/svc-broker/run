@@ -12,7 +12,7 @@ fi
 echo "[broker-mod] Symlinking BIOS directory..."
 # PCSX2 defaults to /config/.config/PCSX2/bios but compose mounts BIOS at /config/bios
 mkdir -p /config/.config/PCSX2
-chown abc:abc /config/.config/PCSX2
+chown abc:abc /config/.config /config/.config/PCSX2
 if [ ! -e /config/.config/PCSX2/bios ]; then
     ln -s /config/bios /config/.config/PCSX2/bios
 fi
