@@ -46,7 +46,7 @@ PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 _PINE_SAVE_STATE = 9
 
 
-def _pine_save_state() -> bool:
+def _pine_save_state(slot: int = PINE_SAVE_SLOT) -> bool:
     """Trigger a save state via PINE IPC and wait for the .p2s file to be written."""
     if not Path(PINE_SOCK).exists():
         log.info("PINE socket not found — no game running, skipping save state")
@@ -59,7 +59,7 @@ def _pine_save_state() -> bool:
             s.settimeout(5.0)
             s.connect(PINE_SOCK)
             # [u32 total_len][u8 opcode][u8 slot] — 6 bytes
-            s.sendall(struct.pack("<IBB", 6, _PINE_SAVE_STATE, PINE_SAVE_SLOT))
+            s.sendall(struct.pack("<IBB", 6, _PINE_SAVE_STATE, slot))
             resp = s.recv(5)  # [u32 total_len][u8 result]
             if len(resp) >= 5:
                 result = struct.unpack("<IB", resp[:5])[1]
@@ -67,7 +67,7 @@ def _pine_save_state() -> bool:
                     log.warning("PINE save state returned error code %d", result)
                     return False
 
-        log.info("Save state queued for slot %d", PINE_SAVE_SLOT)
+        log.info("Save state queued for slot %d", slot)
 
         # Poll up to 5s for the .p2s file to appear or update
         deadline = time.monotonic() + 5.0
@@ -190,6 +190,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok"})
             else:
                 self._send_json(200, {"status": "no_session"})
+            return
+
+        if self.path == "/savestate":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if not _session:
+                self._send_json(409, {"error": "no active session"})
+                return
+            body = self._read_body()
+            slot = int(body.get("slot", PINE_SAVE_SLOT))
+            def _do_save(slot=slot):
+                ok = _pine_save_state(slot)
+                log.info("Manual save state slot %d %s", slot, "succeeded" if ok else "failed")
+            Thread(target=_do_save, daemon=True).start()
+            self._send_json(200, {"status": "saving", "slot": slot})
             return
 
         if self.path != "/launch":
