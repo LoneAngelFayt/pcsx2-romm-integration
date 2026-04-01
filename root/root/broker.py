@@ -111,6 +111,23 @@ def _pine_load_state(slot: int = PINE_SAVE_SLOT) -> bool:
     return False
 
 
+def _take_screenshot() -> bool:
+    """Send F8 to PCSX2's X11 window to trigger a screenshot."""
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--classname", "pcsx2-qt", "key", "--clearmodifiers", "F8"],
+            capture_output=True,
+            env={**os.environ, "DISPLAY": ":0"},
+        )
+        if result.returncode == 0:
+            log.info("Screenshot triggered via xdotool")
+            return True
+        log.warning("xdotool screenshot failed: %s", result.stderr.decode().strip())
+    except Exception as exc:
+        log.warning("Screenshot failed: %s", exc)
+    return False
+
+
 def _kill_pcsx2() -> None:
     """SIGTERM with 8s grace period, SIGKILL if it doesn't exit."""
     try:
@@ -231,6 +248,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 log.info("Manual save state slot %d %s", slot, "succeeded" if ok else "failed")
             Thread(target=_do_save, daemon=True).start()
             self._send_json(200, {"status": "saving", "slot": slot})
+            return
+
+        if self.path == "/screenshot":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if not _session:
+                self._send_json(409, {"error": "no active session"})
+                return
+            ok = _take_screenshot()
+            self._send_json(200 if ok else 502, {"status": "ok" if ok else "failed"})
             return
 
         if self.path == "/loadstate":
