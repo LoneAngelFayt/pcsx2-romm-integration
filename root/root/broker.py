@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread, Lock
@@ -236,18 +237,43 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
-        if self.path == "/health":
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/health":
             self._send_json(200, {"status": "ok"})
-        elif self.path == "/status":
+        elif parsed.path == "/status":
             if _session:
                 self._send_json(200, {
                     "active": True,
                     "rom_path": _session.get("rom_path"),
                     "rom_name": _session.get("rom_name"),
                     "started_at": _session.get("started_at"),
+                    "paused": _session.get("paused", False),
                 })
             else:
                 self._send_json(200, {"active": False})
+        elif parsed.path == "/savefile":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            card = int(params.get("card", ["1"])[0])
+            if card not in (1, 2):
+                self._send_json(400, {"error": "card must be 1 or 2"})
+                return
+            memcard = Path(f"/config/.config/PCSX2/memcards/Mcd00{card}.ps2")
+            if not memcard.exists():
+                self._send_json(404, {"error": f"memcard {card} not found"})
+                return
+            data = memcard.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="Mcd00{card}.ps2"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            log.info("Exported memcard %d (%d bytes)", card, len(data))
         else:
             self._send_json(404, {"error": "not found"})
 
