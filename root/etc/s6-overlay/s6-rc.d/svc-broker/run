@@ -67,7 +67,7 @@ echo $$ > "$PIDFILE"
 export WAYLAND_DISPLAY=wayland-1
 export XDG_RUNTIME_DIR=/config/.XDG
 while true; do
-    foot -e /usr/local/bin/pcsx2-launcher.sh
+    /usr/local/bin/pcsx2-launcher.sh
     sleep 1
 done
 AUTOSTART_EOF

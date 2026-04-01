@@ -1,0 +1,3 @@
+#!/bin/bash
+# Suppress harmless XF86 keysym warnings that flood logs during Xwayland keyboard init.
+exec env PATH=/usr/bin:/bin xkbcomp "$@" 2>/dev/null
