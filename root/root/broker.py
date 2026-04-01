@@ -42,8 +42,9 @@ SSTATES_DIR    = "/config/.config/PCSX2/sstates"
 PINE_SOCK      = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
 PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 
-# PINE save state opcode for PCSX2-Qt
+# PINE opcodes for PCSX2-Qt
 _PINE_SAVE_STATE = 9
+_PINE_LOAD_STATE = 10
 
 
 def _pine_save_state(slot: int = PINE_SAVE_SLOT) -> bool:
@@ -83,6 +84,30 @@ def _pine_save_state(slot: int = PINE_SAVE_SLOT) -> bool:
 
     except Exception as exc:
         log.warning("PINE save state failed: %s", exc)
+    return False
+
+
+def _pine_load_state(slot: int = PINE_SAVE_SLOT) -> bool:
+    """Trigger a load state via PINE IPC."""
+    if not Path(PINE_SOCK).exists():
+        log.info("PINE socket not found — no game running, skipping load state")
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5.0)
+            s.connect(PINE_SOCK)
+            # [u32 total_len][u8 opcode][u8 slot] — 6 bytes
+            s.sendall(struct.pack("<IBB", 6, _PINE_LOAD_STATE, slot))
+            resp = s.recv(5)  # [u32 total_len][u8 result]
+            if len(resp) >= 5:
+                result = struct.unpack("<IB", resp[:5])[1]
+                if result != 0:
+                    log.warning("PINE load state returned error code %d", result)
+                    return False
+        log.info("Load state queued for slot %d", slot)
+        return True
+    except Exception as exc:
+        log.warning("PINE load state failed: %s", exc)
     return False
 
 
@@ -206,6 +231,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 log.info("Manual save state slot %d %s", slot, "succeeded" if ok else "failed")
             Thread(target=_do_save, daemon=True).start()
             self._send_json(200, {"status": "saving", "slot": slot})
+            return
+
+        if self.path == "/loadstate":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if not _session:
+                self._send_json(409, {"error": "no active session"})
+                return
+            body = self._read_body()
+            slot = int(body.get("slot", PINE_SAVE_SLOT))
+            def _do_load(slot=slot):
+                ok = _pine_load_state(slot)
+                log.info("Manual load state slot %d %s", slot, "succeeded" if ok else "failed")
+            Thread(target=_do_load, daemon=True).start()
+            self._send_json(200, {"status": "loading", "slot": slot})
             return
 
         if self.path != "/launch":
