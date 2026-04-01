@@ -43,6 +43,22 @@ SSTATES_DIR    = "/config/.config/PCSX2/sstates"
 PINE_SOCK      = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG"), "pcsx2.sock")
 PINE_SAVE_SLOT = int(os.environ.get("BROKER_SAVE_SLOT", "0"))
 
+# xdotool and pactl must run as abc — xwayland and pulseaudio are scoped to that user's session.
+_ABC_UID = 1000
+_ABC_GID = 1000
+_ABC_ENV = {
+    "DISPLAY": ":0",
+    "HOME": "/config",
+    "USER": "abc",
+    "XDG_RUNTIME_DIR": "/config/.XDG",
+    "WAYLAND_DISPLAY": "wayland-1",
+}
+
+def _as_abc():
+    """preexec_fn: drop to abc before execing a subprocess."""
+    os.setgid(_ABC_GID)
+    os.setuid(_ABC_UID)
+
 # PINE opcodes for PCSX2-Qt
 _PINE_SAVE_STATE = 9
 _PINE_LOAD_STATE = 10
@@ -118,7 +134,8 @@ def _take_screenshot() -> bool:
         result = subprocess.run(
             ["xdotool", "search", "--classname", "pcsx2-qt", "key", "--clearmodifiers", "F8"],
             capture_output=True,
-            env={**os.environ, "DISPLAY": ":0"},
+            env=_ABC_ENV,
+            preexec_fn=_as_abc,
         )
         if result.returncode == 0:
             log.info("Screenshot triggered via xdotool")
@@ -134,7 +151,8 @@ def _set_volume(level: int) -> bool:
     level = max(0, min(100, level))
     try:
         # Find the sink input index owned by the pcsx2-qt process
-        result = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True)
+        result = subprocess.run(["pactl", "list", "sink-inputs"], capture_output=True, text=True,
+                                env=_ABC_ENV, preexec_fn=_as_abc)
         sink_input = None
         current_index = None
         for line in result.stdout.splitlines():
@@ -152,6 +170,7 @@ def _set_volume(level: int) -> bool:
         subprocess.run(
             ["pactl", "set-sink-input-volume", sink_input, f"{level}%"],
             capture_output=True, check=True,
+            env=_ABC_ENV, preexec_fn=_as_abc,
         )
         log.info("Volume set to %d%% (sink input %s)", level, sink_input)
         return True
