@@ -161,20 +161,40 @@ def _set_volume(level: int) -> bool:
 
 
 def _kill_pcsx2() -> None:
-    """SIGTERM with 8s grace period, SIGKILL if it doesn't exit."""
+    """SIGTERM with 8s grace period, SIGKILL if it doesn't exit.
+    Captures target PIDs upfront to avoid race conditions with newly launched processes."""
     try:
-        if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode == 0:
-            log.info("Requesting graceful stop (SIGTERM) for PCSX2...")
-            subprocess.run(["pkill", "-15", "-f", "pcsx2-qt"], capture_output=True)
+        # Get all current pcsx2-qt PIDs
+        res = subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True, text=True)
+        pids = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+        
+        if not pids:
+            return
 
-            for _ in range(16):
-                if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode != 0:
-                    log.info("PCSX2-Qt exited gracefully.")
-                    return
-                time.sleep(0.5)
+        log.info("Requesting graceful stop (SIGTERM) for PCSX2 (PIDs: %s)...", ", ".join(pids))
+        for pid in pids:
+            subprocess.run(["kill", "-15", pid], capture_output=True)
 
-            log.warning("PCSX2-Qt didn't close in time. Forcing exit...")
-            subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+        # Wait up to 8s for these specific PIDs to disappear
+        for _ in range(16):
+            remaining = []
+            for pid in pids:
+                if subprocess.run(["kill", "-0", pid], capture_output=True).returncode == 0:
+                    remaining.append(pid)
+            
+            if not remaining:
+                log.info("PCSX2-Qt exited gracefully.")
+                return
+            time.sleep(0.5)
+
+        # Force SIGKILL on any that are still around
+        res = subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True, text=True)
+        current_pids = [p.strip() for p in res.stdout.splitlines() if p.strip()]
+        for pid in pids:
+            if pid in current_pids:
+                log.warning("PCSX2-Qt (PID %s) didn't close in time. Forcing SIGKILL...", pid)
+                subprocess.run(["kill", "-9", pid], capture_output=True)
+                
     except Exception as exc:
         log.warning("Error during PCSX2 shutdown: %s", exc)
 
@@ -184,6 +204,9 @@ def _kill_pcsx2() -> None:
 def _release_session():
     """Save state and return to dashboard. Shared by DELETE /launch and heartbeat timeout."""
     global _last_heartbeat
+    if not _session:
+        return
+
     _pine_save_state()
     Path(ROM_FILE).unlink(missing_ok=True)
     _kill_pcsx2()
