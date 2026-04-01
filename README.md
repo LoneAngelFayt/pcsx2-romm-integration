@@ -256,6 +256,12 @@ Check logs with `docker logs pcsx2`. The s6 supervisor will attempt to restart i
 
 ---
 
+## Roadmap
+
+- **Per-game save file endpoints** — serve and receive individual game saves rather than full memory card images.
+
+---
+
 ## License
 
 GPLv3
