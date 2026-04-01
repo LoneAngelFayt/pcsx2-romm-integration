@@ -281,6 +281,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "saving", "slot": slot})
             return
 
+        if self.path == "/pause":
+            if not self._check_secret():
+                self._send_json(403, {"error": "forbidden"})
+                return
+            if not _session:
+                self._send_json(409, {"error": "no active session"})
+                return
+            paused = _session.get("paused", False)
+            sig = "SIGCONT" if paused else "SIGSTOP"
+            result = subprocess.run(["pkill", f"-{sig}", "-f", "pcsx2-qt"], capture_output=True)
+            if result.returncode == 0:
+                _session["paused"] = not paused
+                state = "resumed" if paused else "paused"
+                log.info("PCSX2 %s", state)
+                self._send_json(200, {"status": state, "paused": not paused})
+            else:
+                self._send_json(502, {"error": "no PCSX2 process found"})
+            return
+
         if self.path == "/restart":
             if not self._check_secret():
                 self._send_json(403, {"error": "forbidden"})
