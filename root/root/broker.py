@@ -432,19 +432,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         def _do_launch():
             global _last_heartbeat
-            # Kill first, then write the ROM file. If the order is reversed,
-            # autostart can relaunch PCSX2 with the ROM during the 8s SIGKILL
-            # grace period and _kill_pcsx2() will kill the new game process.
-            _kill_pcsx2()
-            
-            # Write the signal file and ensure the 'abc' user (1000) can delete it
+            # write rom file before killing -- launcher sees it the moment pcsx2 exits.
+            # safe because _kill_pcsx2() captures pids upfront and won't kill the new process.
             Path(ROM_FILE).write_text(rom_path)
             try:
                 os.chown(ROM_FILE, 1000, 1000)
             except OSError:
                 pass
-            
             log.info("Wrote ROM path to launcher signal file: %s", rom_path)
+            _kill_pcsx2()
             _session.update({
                 "rom_path": rom_path,
                 "rom_name": rom_name,

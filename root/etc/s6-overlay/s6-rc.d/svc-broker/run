@@ -46,9 +46,10 @@ if (( INI_FOUND == 0 )); then
     echo "[broker-mod] WARNING: PCSX2.ini never appeared — PINE IPC will not be enabled until next restart"
 fi
 
-echo "[broker-mod] Setting broker.py and launcher executable..."
+echo "[broker-mod] Setting broker.py and launcher executables..."
 chmod +x /root/broker.py
 chmod 755 /usr/local/bin/pcsx2-launcher.sh
+chmod 755 /usr/local/bin/pcsx2-autostart.sh
 
 # cleanup orphaned signal files from previous runs to prevent loops
 if [ -f "/tmp/pcsx2-rom" ]; then
@@ -59,27 +60,8 @@ fi
 echo "[broker-mod] Writing labwc autostart..."
 AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
-cat > "$AUTOSTART" << 'AUTOSTART_EOF'
-#!/bin/bash
-PIDFILE=/tmp/pcsx2-autostart.pid
-
-# Kill any orphaned autostart loop left over from a previous labwc session
-if [ -f "$PIDFILE" ]; then
-    OLD_PID=$(cat "$PIDFILE")
-    if [ "$OLD_PID" != "$$" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        kill "$OLD_PID" 2>/dev/null
-        pkill -P "$OLD_PID" 2>/dev/null
-    fi
-fi
-echo $$ > "$PIDFILE"
-
-export WAYLAND_DISPLAY=wayland-1
-export XDG_RUNTIME_DIR=/config/.XDG
-while true; do
-    /usr/local/bin/pcsx2-launcher.sh
-    sleep 1
-done
-AUTOSTART_EOF
+# labwc runs autostart line-by-line in subshells -- multi-line bash cannot be used here.
+printf '/usr/local/bin/pcsx2-autostart.sh\n' > "$AUTOSTART"
 chmod +x "$AUTOSTART"
 
 echo "[broker-mod] Starting broker.py..."
