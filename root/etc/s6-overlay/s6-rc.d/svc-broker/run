@@ -64,5 +64,12 @@ mkdir -p "$(dirname "$AUTOSTART")"
 printf '/usr/local/bin/pcsx2-autostart.sh\n' > "$AUTOSTART"
 chmod +x "$AUTOSTART"
 
+# labwc already processed its autostart before this script ran -- start the loop directly.
+echo "[broker-mod] Stopping base-image pcsx2-qt and starting managed launcher loop..."
+pkill -f pcsx2-qt 2>/dev/null || true
+sleep 1
+setsid su abc -c '/usr/local/bin/pcsx2-autostart.sh' &
+echo "[broker-mod] Managed launcher loop started"
+
 echo "[broker-mod] Starting broker.py..."
 exec python3 -u /root/broker.py
