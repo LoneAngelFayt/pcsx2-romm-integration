@@ -436,7 +436,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # autostart can relaunch PCSX2 with the ROM during the 8s SIGKILL
             # grace period and _kill_pcsx2() will kill the new game process.
             _kill_pcsx2()
+            
+            # Write the signal file and ensure the 'abc' user (1000) can delete it
             Path(ROM_FILE).write_text(rom_path)
+            try:
+                os.chown(ROM_FILE, 1000, 1000)
+            except OSError:
+                pass
+            
             log.info("Wrote ROM path to launcher signal file: %s", rom_path)
             _session.update({
                 "rom_path": rom_path,
