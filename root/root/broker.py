@@ -26,7 +26,6 @@ ENV = {
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
@@ -127,7 +126,8 @@ def _monitor_process(proc):
     with _session_lock:
         # If we didn't intentionally kill it, relaunch into dashboard mode
         if _session["is_managed"] and _session["process"] == proc:
-            log.info("PCSX2 exited (managed). Relaunching dashboard...")
+            log.info("PCSX2 exited (managed). Relaunching dashboard in 1s...")
+            time.sleep(1)
             _session["rom_path"] = None
             _session["rom_name"] = "Dashboard"
             _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -136,6 +136,13 @@ def _monitor_process(proc):
 
 def _launch_pcsx2_internal(rom_path):
     """Launch pcsx2-qt via sudo -u abc. Assumes INI is already patched if needed."""
+    
+    # Pre-launch fix for Selkies sockets
+    try:
+        subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
+    except:
+        pass
+
     # Construct command
     cmd = [
         "sudo", "-u", "abc",
@@ -144,7 +151,6 @@ def _launch_pcsx2_internal(rom_path):
         f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
         f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
         f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
-        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
         "pcsx2-qt", "-batch", "-fullscreen"
