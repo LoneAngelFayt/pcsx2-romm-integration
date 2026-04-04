@@ -25,6 +25,7 @@ ENV = {
     "DISPLAY": ":0",
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
+    "PULSE_RUNTIME_PATH": "/defaults",
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
@@ -127,6 +128,7 @@ def _launch_pcsx2(rom_path):
         f"DISPLAY={ENV['DISPLAY']}",
         f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
         f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
+        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
         "pcsx2-qt", "-batch", "-fullscreen"
