@@ -172,8 +172,8 @@ def _launch_pcsx2_internal(rom_path):
         # Launch in background
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             preexec_fn=os.setpgrp # Create new process group
         )
         _session["process"] = proc
@@ -186,6 +186,11 @@ def _launch_pcsx2_internal(rom_path):
         log.error("Failed to launch PCSX2: %s", exc)
         _session["process"] = None
         _session["is_managed"] = False
+        stdout, stderr = proc.communicate(timeout=5)
+    if stdout:
+        log.info("PCSX2 stdout: %s", stdout.decode())
+    if stderr:
+        log.error("PCSX2 stderr: %s", stderr.decode())
 
 
 def _launch_pcsx2(rom_path):
