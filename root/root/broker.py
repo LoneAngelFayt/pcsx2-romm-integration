@@ -28,7 +28,7 @@ ENV = {
     "PULSE_RUNTIME_PATH": "/defaults",
 #    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
     "HOME": "/config",
-#    "USER": "abc",
+    "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
 #    "SDL_JOYSTICK_DEVICE": "/dev/input/js0",   # Tell SDL to look specifically at the virtual js0
 #    "SDL_GAMECONTROLLERCONFIG": "1",           # Enable game controller mapping (try "0" if 1 doesn't work)
