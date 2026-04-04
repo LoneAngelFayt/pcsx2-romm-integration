@@ -13,7 +13,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,11 +43,13 @@ log = logging.getLogger("broker")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
+_session_lock = Lock()
 _session: dict = {
     "process": None,
     "rom_path": None,
     "rom_name": None,
     "started_at": None,
+    "is_managed": False, # If true, we want to keep it running
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,8 +88,6 @@ def _patch_ini():
         # Add any missing keys
         for key, val in patches.items():
             if key not in applied:
-                # This is a bit naive as it doesn't respect sections, 
-                # but PCSX2 is generally okay with it or will move them.
                 new_lines.append(val)
         
         INI_PATH.write_text("\n".join(new_lines))
@@ -98,14 +98,16 @@ def _patch_ini():
 
 def _kill_pcsx2():
     """Stop any running pcsx2-qt instance."""
-    # First, stop our managed process if it exists
-    if _session["process"] and _session["process"].poll() is None:
-        log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
-        _session["process"].terminate()
-        try:
-            _session["process"].wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _session["process"].kill()
+    with _session_lock:
+        _session["is_managed"] = False
+        if _session["process"] and _session["process"].poll() is None:
+            log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
+            _session["process"].terminate()
+            try:
+                _session["process"].wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _session["process"].kill()
+        _session["process"] = None
 
     # Also kill any unmanaged instances just in case
     try:
@@ -117,10 +119,22 @@ def _kill_pcsx2():
         log.warning("Error during pkill: %s", exc)
 
 
-def _launch_pcsx2(rom_path):
-    """Launch pcsx2-qt via sudo -u abc."""
-    _patch_ini()
+def _monitor_process(proc):
+    """Wait for the process to exit, then relaunch dashboard if still managed."""
+    proc.wait()
     
+    with _session_lock:
+        # If we didn't intentionally kill it, relaunch into dashboard mode
+        if _session["is_managed"] and _session["process"] == proc:
+            log.info("PCSX2 exited (managed). Relaunching dashboard...")
+            _session["rom_path"] = None
+            _session["rom_name"] = "Dashboard"
+            _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _launch_pcsx2_internal(None)
+
+
+def _launch_pcsx2_internal(rom_path):
+    """Launch pcsx2-qt via sudo -u abc. Assumes INI is already patched if needed."""
     # Construct command
     cmd = [
         "sudo", "-u", "abc",
@@ -148,13 +162,28 @@ def _launch_pcsx2(rom_path):
             preexec_fn=os.setpgrp # Create new process group
         )
         _session["process"] = proc
-        _session["rom_path"] = rom_path
-        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _session["is_managed"] = True
         log.info("PCSX2 launched with PID %d", proc.pid)
+        
+        # Monitor for exit
+        Thread(target=_monitor_process, args=(proc,), daemon=True).start()
     except Exception as exc:
         log.error("Failed to launch PCSX2: %s", exc)
         _session["process"] = None
+        _session["is_managed"] = False
+
+
+def _launch_pcsx2(rom_path):
+    """Stop existing, patch, and launch new."""
+    _kill_pcsx2()
+    _patch_ini()
+    time.sleep(1)
+    
+    with _session_lock:
+        _session["rom_path"] = rom_path
+        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
+        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _launch_pcsx2_internal(rom_path)
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -191,13 +220,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
         elif self.path == "/status":
-            active = _session["process"] is not None and _session["process"].poll() is None
-            self._send_json(200, {
-                "active": active,
-                "rom_path": _session["rom_path"] if active else None,
-                "rom_name": _session["rom_name"] if active else None,
-                "started_at": _session["started_at"] if active else None,
-            })
+            with _session_lock:
+                active = _session["process"] is not None and _session["process"].poll() is None
+                self._send_json(200, {
+                    "active": active,
+                    "rom_path": _session["rom_path"] if active else None,
+                    "rom_name": _session["rom_name"] if active else None,
+                    "started_at": _session["started_at"] if active else None,
+                })
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -220,12 +250,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": "rom_path does not exist", "path": rom_path})
             return
 
-        def _task():
-            _kill_pcsx2()
-            time.sleep(1)
-            _launch_pcsx2(rom_path)
-
-        Thread(target=_task, daemon=True).start()
+        Thread(target=_launch_pcsx2, args=(rom_path,), daemon=True).start()
         self._send_json(200, {"status": "launching", "rom_path": rom_path})
 
     def do_DELETE(self):
@@ -237,12 +262,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         def _task():
-            _kill_pcsx2()
-            _session["process"] = None
-            log.info("Session released")
+            log.info("Soft reset: returning to dashboard")
+            _launch_pcsx2(None)
 
         Thread(target=_task, daemon=True).start()
-        self._send_json(200, {"status": "stopping"})
+        self._send_json(200, {"status": "resetting"})
 
     def do_OPTIONS(self):
         self.send_response(204)
