@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 broker.py — ROM launch broker for linuxserver/pcsx2 container
+Directly launches pcsx2-qt as 'abc' user.
 """
 
 import json
 import logging
 import os
-import pwd
+import signal
 import subprocess
 import sys
 import time
@@ -17,8 +18,19 @@ from threading import Thread
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PORT    = int(os.environ.get("BROKER_PORT", "8000"))
-DISPLAY = os.environ.get("DISPLAY", ":1")
 SECRET  = os.environ.get("BROKER_SECRET", "")
+
+# Environment for pcsx2-qt
+ENV = {
+    "DISPLAY": ":0",
+    "WAYLAND_DISPLAY": "wayland-1",
+    "XDG_RUNTIME_DIR": "/config/.XDG",
+    "HOME": "/config",
+    "USER": "abc",
+    "QT_QPA_PLATFORM": "xcb",
+}
+
+INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,47 +42,117 @@ log = logging.getLogger("broker")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-_session: dict = {}
+_session: dict = {
+    "process": None,
+    "rom_path": None,
+    "rom_name": None,
+    "started_at": None,
+}
 
-# ── Process helpers ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-ROM_FILE = "/tmp/pcsx2-rom"
+def _patch_ini():
+    """Ensure PCSX2 is configured for headless/remote launch."""
+    if not INI_PATH.exists():
+        log.warning("PCSX2.ini not found at %s. Skipping patch.", INI_PATH)
+        return
 
-def _kill_pcsx2() -> None:
-    """Graceful shutdown — SIGTERM first, SIGKILL fallback."""
     try:
-        if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode == 0:
-            log.info("Requesting graceful stop (SIGTERM) for PCSX2...")
-            subprocess.run(["pkill", "-15", "-f", "pcsx2-qt"], capture_output=True)
-
-            for _ in range(16):
-                if subprocess.run(["pgrep", "-f", "pcsx2-qt"], capture_output=True).returncode != 0:
-                    log.info("PCSX2-Qt exited gracefully.")
-                    return
-                time.sleep(0.5)
-
-            log.warning("PCSX2-Qt didn't close in time. Forcing exit...")
-            subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+        content = INI_PATH.read_text()
+        lines = content.splitlines()
+        new_lines = []
+        
+        # Simple line-by-line replacement for key settings
+        patches = {
+            "EnablePINE": "EnablePINE = true",
+            "StartFullscreen": "StartFullscreen = true",
+            "SetupWizardIncomplete": "SetupWizardIncomplete = false",
+            "ConfirmShutdown": "ConfirmShutdown = false",
+        }
+        
+        applied = set()
+        for line in lines:
+            matched = False
+            for key, val in patches.items():
+                if line.strip().startswith(f"{key} =") or line.strip() == f"{key}=":
+                    new_lines.append(val)
+                    applied.add(key)
+                    matched = True
+                    break
+            if not matched:
+                new_lines.append(line)
+        
+        # Add any missing keys
+        for key, val in patches.items():
+            if key not in applied:
+                # This is a bit naive as it doesn't respect sections, 
+                # but PCSX2 is generally okay with it or will move them.
+                new_lines.append(val)
+        
+        INI_PATH.write_text("\n".join(new_lines))
+        log.info("PCSX2.ini patched (PINE, Fullscreen, NoWizard)")
     except Exception as exc:
-        log.warning("Error during PCSX2 shutdown: %s", exc)
+        log.error("Failed to patch PCSX2.ini: %s", exc)
 
 
-def _launch_pcsx2(rom_path=None) -> None:
-    """
-    Signal the launcher script by writing the ROM path to a file,
-    then kill PCSX2. The container's RESTART_APP watchdog or autostart
-    will relaunch it via pcsx2-launcher.sh which reads the file.
-    """
+def _kill_pcsx2():
+    """Stop any running pcsx2-qt instance."""
+    # First, stop our managed process if it exists
+    if _session["process"] and _session["process"].poll() is None:
+        log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
+        _session["process"].terminate()
+        try:
+            _session["process"].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _session["process"].kill()
+
+    # Also kill any unmanaged instances just in case
+    try:
+        subprocess.run(["pkill", "-15", "-f", "pcsx2-qt"], capture_output=True)
+        time.sleep(1)
+        # Force kill if still there
+        subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+    except Exception as exc:
+        log.warning("Error during pkill: %s", exc)
+
+
+def _launch_pcsx2(rom_path):
+    """Launch pcsx2-qt via sudo -u abc."""
+    _patch_ini()
+    
+    # Construct command
+    cmd = [
+        "sudo", "-u", "abc",
+        "env",
+        f"DISPLAY={ENV['DISPLAY']}",
+        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
+        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
+        f"HOME={ENV['HOME']}",
+        f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
+        "pcsx2-qt", "-batch", "-fullscreen"
+    ]
+    
     if rom_path:
-        Path(ROM_FILE).write_text(rom_path)
-        log.info("Wrote ROM path to launcher signal file: %s", rom_path)
-    else:
-        Path(ROM_FILE).unlink(missing_ok=True)
-        log.info("Cleared ROM signal — launcher will start dashboard")
-
-    # Small delay then kill — watchdog/autostart handles the relaunch
-    time.sleep(0.5)
-    _kill_pcsx2()
+        cmd.append(rom_path)
+    
+    log.info("Launching: %s", " ".join(cmd))
+    
+    try:
+        # Launch in background
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setpgrp # Create new process group
+        )
+        _session["process"] = proc
+        _session["rom_path"] = rom_path
+        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
+        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        log.info("PCSX2 launched with PID %d", proc.pid)
+    except Exception as exc:
+        log.error("Failed to launch PCSX2: %s", exc)
+        _session["process"] = None
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -107,15 +189,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
         elif self.path == "/status":
-            if _session:
-                self._send_json(200, {
-                    "active": True,
-                    "rom_path": _session.get("rom_path"),
-                    "rom_name": _session.get("rom_name"),
-                    "started_at": _session.get("started_at"),
-                })
-            else:
-                self._send_json(200, {"active": False})
+            active = _session["process"] is not None and _session["process"].poll() is None
+            self._send_json(200, {
+                "active": active,
+                "rom_path": _session["rom_path"] if active else None,
+                "rom_name": _session["rom_name"] if active else None,
+                "started_at": _session["started_at"] if active else None,
+            })
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -129,38 +209,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         body = self._read_body()
         rom_path = body.get("rom_path", "").strip()
-        rom_name = body.get("rom_name", Path(rom_path).stem if rom_path else "")
 
         if not rom_path:
             self._send_json(400, {"error": "rom_path is required"})
             return
 
         if not Path(rom_path).exists():
-            log.warning("ROM not found: %s", rom_path)
-            self._send_json(422, {
-                "error": "rom_path does not exist inside the container",
-                "rom_path": rom_path,
-                "hint": "Check that your ROMs volume is mounted at the same path in both containers",
-            })
+            self._send_json(422, {"error": "rom_path does not exist", "path": rom_path})
             return
 
-        def _do_launch():
+        def _task():
             _kill_pcsx2()
-            time.sleep(1.0)
+            time.sleep(1)
             _launch_pcsx2(rom_path)
-            _session.update({
-                "rom_path": rom_path,
-                "rom_name": rom_name,
-                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
-            log.info("Session started: %s", rom_name)
 
-        Thread(target=_do_launch, daemon=True).start()
-        self._send_json(200, {
-            "status": "launched",
-            "rom_path": rom_path,
-            "rom_name": rom_name,
-        })
+        Thread(target=_task, daemon=True).start()
+        self._send_json(200, {"status": "launching", "rom_path": rom_path})
 
     def do_DELETE(self):
         if self.path != "/launch":
@@ -170,15 +234,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden"})
             return
 
-        def _do_soft_reset():
-            log.info("Soft reset: stopping game, relaunching dashboard")
+        def _task():
             _kill_pcsx2()
-            time.sleep(1.0)
-            _launch_pcsx2(rom_path=None)
-            _session.clear()
-            log.info("Soft reset complete")
+            _session["process"] = None
+            log.info("Session released")
 
-        Thread(target=_do_soft_reset, daemon=True).start()
+        Thread(target=_task, daemon=True).start()
         self._send_json(200, {"status": "stopping"})
 
     def do_OPTIONS(self):
@@ -194,11 +255,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 def main():
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
-    log.info("DISPLAY=%s", DISPLAY)
     if SECRET:
         log.info("Shared secret auth enabled")
-    else:
-        log.warning("No BROKER_SECRET set — unauthenticated access allowed")
 
     try:
         server.serve_forever()
