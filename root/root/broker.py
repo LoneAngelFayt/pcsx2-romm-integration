@@ -155,11 +155,15 @@ def _launch_pcsx2_internal(rom_path):
         f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
-        "pcsx2-qt", "-batch", "-fullscreen"
+        "pcsx2-qt"
     ]
     
     if rom_path:
-        cmd.append(rom_path)
+        cmd.extend(["-batch", "-fullscreen", rom_path])
+    else:
+        # Launching dashboard/main menu.
+        # -bigpicture is the controller-friendly UI.
+        cmd.append("-bigpicture")
     
     log.info("Launching: %s", " ".join(cmd))
     
