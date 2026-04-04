@@ -105,7 +105,7 @@ def _kill_pcsx2():
             log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
             _session["process"].terminate()
             try:
-                _session["process"].wait(timeout=5)
+                _session["process"].wait(timeout=8)
             except subprocess.TimeoutExpired:
                 _session["process"].kill()
         _session["process"] = None
@@ -140,20 +140,19 @@ def _launch_pcsx2_internal(rom_path):
     
     # Pre-launch fix for Selkies sockets
     try:
-        subprocess.run("rm -f /tmp/selkies_event* /tmp/selkies_js* 2>/dev/null || true", shell=True)
         subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
-    except:
-        pass
+    except Exception as e:
+        log.warning("Failed to chmod selkies sockets: %s", e)
 
     # Construct command
     cmd = [
-        "sudo", "-u", "abc",
+        "s6-setuidgid", "abc",
         "env",
         f"DISPLAY={ENV['DISPLAY']}",
         f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
         f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
         f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
-        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
+#        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
         "pcsx2-qt"
