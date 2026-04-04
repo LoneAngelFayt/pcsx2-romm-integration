@@ -26,12 +26,12 @@ ENV = {
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
+#    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
     "HOME": "/config",
-    "USER": "abc",
+#    "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
-    "SDL_JOYSTICK_DEVICE": "/dev/input/js0",   # Tell SDL to look specifically at the virtual js0
-    "SDL_GAMECONTROLLERCONFIG": "1",           # Enable game controller mapping (try "0" if 1 doesn't work)
+#    "SDL_JOYSTICK_DEVICE": "/dev/input/js0",   # Tell SDL to look specifically at the virtual js0
+#    "SDL_GAMECONTROLLERCONFIG": "1",           # Enable game controller mapping (try "0" if 1 doesn't work)
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
@@ -149,11 +149,11 @@ def _launch_pcsx2_internal(rom_path):
     # Construct command
     cmd = [
         "s6-setuidgid", "abc",
-        "env",
-        f"DISPLAY={ENV['DISPLAY']}",
-        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
-        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
-        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
+#        "env",
+#        f"DISPLAY={ENV['DISPLAY']}",
+#        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
+#        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
+#        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
 #        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
