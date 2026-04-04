@@ -140,6 +140,7 @@ def _launch_pcsx2_internal(rom_path):
     
     # Pre-launch fix for Selkies sockets
     try:
+        subprocess.run("rm -f /tmp/selkies_event* /tmp/selkies_js* 2>/dev/null || true", shell=True)
         subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
     except:
         pass
