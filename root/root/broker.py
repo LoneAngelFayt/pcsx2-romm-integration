@@ -149,12 +149,12 @@ def _launch_pcsx2_internal(rom_path):
     # Construct command
     cmd = [
         "s6-setuidgid", "abc",
-#        "env",
-#        f"DISPLAY={ENV['DISPLAY']}",
-#        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
-#        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
-#        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
-#        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
+        "env",
+        f"DISPLAY={ENV['DISPLAY']}",
+        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
+        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
+        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
+        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
         "pcsx2-qt"
