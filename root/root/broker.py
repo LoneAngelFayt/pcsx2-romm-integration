@@ -26,6 +26,7 @@ ENV = {
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
@@ -143,6 +144,7 @@ def _launch_pcsx2_internal(rom_path):
         f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
         f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
         f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
+        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
         f"HOME={ENV['HOME']}",
         f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
         "pcsx2-qt", "-batch", "-fullscreen"
