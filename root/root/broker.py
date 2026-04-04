@@ -30,6 +30,8 @@ ENV = {
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
+    "SDL_JOYSTICK_DEVICE": "/dev/input/js0",   # Tell SDL to look specifically at the virtual js0
+    "SDL_GAMECONTROLLERCONFIG": "1",           # Enable game controller mapping (try "0" if 1 doesn't work)
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
