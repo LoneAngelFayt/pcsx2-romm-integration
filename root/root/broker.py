@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 broker.py — ROM launch broker for linuxserver/pcsx2 container
-Directly launches pcsx2-qt as 'abc' user.
+Directly launches pcsx2-qt as 'abc' user via s6-setuidgid.
 """
 
 import json
@@ -26,12 +26,10 @@ ENV = {
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
-#    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
-#    "SDL_JOYSTICK_DEVICE": "/dev/input/js0",   # Tell SDL to look specifically at the virtual js0
-#    "SDL_GAMECONTROLLERCONFIG": "1",           # Enable game controller mapping (try "0" if 1 doesn't work)
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
@@ -107,7 +105,7 @@ def _kill_pcsx2():
             log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
             _session["process"].terminate()
             try:
-                _session["process"].wait(timeout=8)
+                _session["process"].wait(timeout=5)
             except subprocess.TimeoutExpired:
                 _session["process"].kill()
         _session["process"] = None
@@ -122,15 +120,18 @@ def _kill_pcsx2():
         log.warning("Error during pkill: %s", exc)
 
 
-def _monitor_process(proc):
+def _monitor_process(proc, start_time):
     """Wait for the process to exit, then relaunch dashboard if still managed."""
     proc.wait()
+    duration = time.monotonic() - start_time
     
     with _session_lock:
         # If we didn't intentionally kill it, relaunch into dashboard mode
         if _session["is_managed"] and _session["process"] == proc:
-            log.info("PCSX2 exited (managed). Relaunching dashboard in 1s...")
-            time.sleep(1)
+            # Backoff if it died too quickly
+            wait_time = 5 if duration < 5 else 1
+            log.info("PCSX2 exited (managed) after %.1fs. Relaunching dashboard in %ds...", duration, wait_time)
+            time.sleep(wait_time)
             _session["rom_path"] = None
             _session["rom_name"] = "Dashboard"
             _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -138,42 +139,33 @@ def _monitor_process(proc):
 
 
 def _launch_pcsx2_internal(rom_path):
-    """Launch pcsx2-qt via sudo -u abc. Assumes INI is already patched if needed."""
+    """Launch pcsx2-qt via s6-setuidgid abc."""
     
     # Pre-launch fix for Selkies sockets
     try:
         subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
-    except Exception as e:
-        log.warning("Failed to chmod selkies sockets: %s", e)
+    except:
+        pass
 
     # Construct command
-    cmd = [
-        "s6-setuidgid", "abc",
-        "env",
-        f"DISPLAY={ENV['DISPLAY']}",
-        f"WAYLAND_DISPLAY={ENV['WAYLAND_DISPLAY']}",
-        f"XDG_RUNTIME_DIR={ENV['XDG_RUNTIME_DIR']}",
-        f"PULSE_RUNTIME_PATH={ENV['PULSE_RUNTIME_PATH']}",
-        f"LD_PRELOAD={ENV['LD_PRELOAD']}",
-        f"HOME={ENV['HOME']}",
-        f"QT_QPA_PLATFORM={ENV['QT_QPA_PLATFORM']}",
-        "pcsx2-qt"
-    ]
+    cmd = ["s6-setuidgid", "abc", "pcsx2-qt"]
     
     if rom_path:
         cmd.extend(["-batch", "-fullscreen", rom_path])
-    else:
-        # Launching dashboard/main menu.
-        pass
     
     log.info("Launching: %s", " ".join(cmd))
+    
+    # Prepare environment
+    run_env = os.environ.copy()
+    run_env.update(ENV)
     
     try:
         # Launch in background
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            env=run_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             preexec_fn=os.setpgrp # Create new process group
         )
         _session["process"] = proc
@@ -181,7 +173,7 @@ def _launch_pcsx2_internal(rom_path):
         log.info("PCSX2 launched with PID %d", proc.pid)
         
         # Monitor for exit
-        Thread(target=_monitor_process, args=(proc,), daemon=True).start()
+        Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
     except Exception as exc:
         log.error("Failed to launch PCSX2: %s", exc)
         _session["process"] = None
