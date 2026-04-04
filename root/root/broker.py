@@ -162,8 +162,7 @@ def _launch_pcsx2_internal(rom_path):
         cmd.extend(["-batch", "-fullscreen", rom_path])
     else:
         # Launching dashboard/main menu.
-        # -bigpicture is the controller-friendly UI.
-        cmd.append("-bigpicture")
+        pass
     
     log.info("Launching: %s", " ".join(cmd))
     
