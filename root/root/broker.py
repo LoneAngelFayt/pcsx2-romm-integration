@@ -141,6 +141,13 @@ def _monitor_process(proc, start_time):
 def _launch_pcsx2_internal(rom_path):
     """Launch pcsx2-qt via s6-setuidgid abc."""
     
+    # Force cleanup of any existing instances first
+    try:
+        subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+        time.sleep(0.5)
+    except:
+        pass
+
     # Pre-launch fix for Selkies sockets
     try:
         subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
