@@ -286,6 +286,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    log.info("Starting broker in 5s (waiting for desktop)...")
+    time.sleep(5)
+    
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
     if SECRET:
