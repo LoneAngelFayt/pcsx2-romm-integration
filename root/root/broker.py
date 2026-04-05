@@ -26,7 +26,7 @@ ENV = {
     "WAYLAND_DISPLAY": "wayland-1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
     "HOME": "/config",
     "USER": "abc",
     "QT_QPA_PLATFORM": "xcb",
@@ -148,9 +148,10 @@ def _launch_pcsx2_internal(rom_path):
     except:
         pass
 
-    # Pre-launch fix for Selkies sockets
+    # Pre-launch fix for Selkies sockets and XDG permissions
     try:
         subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
+        subprocess.run(["chmod", "700", "/config/.XDG"], capture_output=True)
     except:
         pass
 
