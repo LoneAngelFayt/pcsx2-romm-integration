@@ -60,10 +60,9 @@ def _patch_ini():
         return
     try:
         patches = {
-            "EnablePINE":          "EnablePINE = true",
-            "StartFullscreen":     "StartFullscreen = true",
-            "SetupWizardIncomplete":"SetupWizardIncomplete = false",
-            "ConfirmShutdown":     "ConfirmShutdown = false",
+            "EnablePINE":      "EnablePINE = true",
+            "StartFullscreen": "StartFullscreen = true",
+            "ConfirmShutdown": "ConfirmShutdown = false",
         }
         lines = INI_PATH.read_text().splitlines()
         applied = set()
@@ -82,7 +81,7 @@ def _patch_ini():
             if key not in applied:
                 new_lines.append(val)
         INI_PATH.write_text("\n".join(new_lines))
-        log.info("PCSX2.ini patched (PINE, Fullscreen, NoWizard)")
+        log.info("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown)")
     except Exception as exc:
         log.error("Failed to patch PCSX2.ini: %s", exc)
 
@@ -179,6 +178,19 @@ def _launch_pcsx2(rom_path):
     _launch_pcsx2_internal(rom_path)
 
 
+def _cleanup_sockets():
+    """Restart the selkies service to flush all accumulated stale gamepad socket
+    connections. The selkies asyncio handler doesn't detect half-closed Unix
+    sockets on idle gamepad slots, so connections accumulate until restarted.
+    s6-overlay automatically brings selkies back within a few seconds."""
+    log.info("Socket cleanup: restarting selkies to flush stale gamepad connections...")
+    result = subprocess.run(["pkill", "-15", "-f", "selkies"], capture_output=True)
+    if result.returncode == 0:
+        log.info("Socket cleanup: selkies stopped, s6 will restart it shortly.")
+    else:
+        log.warning("Socket cleanup: selkies not found or already stopped.")
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -228,11 +240,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/launch":
-            self._send_json(404, {"error": "not found"})
-            return
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
+            return
+
+        if self.path == "/cleanup":
+            Thread(target=_cleanup_sockets, daemon=True).start()
+            self._send_json(200, {"status": "cleanup started"})
+            return
+
+        if self.path != "/launch":
+            self._send_json(404, {"error": "not found"})
             return
 
         body = self._read_body()
@@ -249,11 +267,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "launching", "rom_path": rom_path})
 
     def do_DELETE(self):
-        if self.path != "/launch":
-            self._send_json(404, {"error": "not found"})
-            return
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
+            return
+        if self.path != "/launch":
+            self._send_json(404, {"error": "not found"})
             return
 
         Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
