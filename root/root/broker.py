@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 broker.py — ROM launch broker for linuxserver/pcsx2 container
-Launches pcsx2-qt as 'abc' user via s6-setuidgid.
+Launches pcsx2-qt as 'abc' user via sudo+env.
 """
 
 import json
@@ -112,19 +112,20 @@ def _kill_pcsx2():
 
 
 def _launch_pcsx2_internal(rom_path):
-    """Exec pcsx2-qt via s6-setuidgid abc. Updates session state inside lock."""
-    cmd = ["s6-setuidgid", "abc", "pcsx2-qt"]
+    """Launch pcsx2-qt as abc via sudo+env (inline env vars bypass sudo's env scrubbing)."""
+    cmd = [
+        "sudo", "-u", "abc", "env",
+        *[f"{k}={v}" for k, v in ENV.items()],
+        "pcsx2-qt",
+    ]
     if rom_path:
         cmd.extend(["-batch", "-fullscreen", rom_path])
 
     log.info("Launching: %s", " ".join(cmd))
-    run_env = os.environ.copy()
-    run_env.update(ENV)
 
     try:
         proc = subprocess.Popen(
             cmd,
-            env=run_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             preexec_fn=os.setpgrp,  # isolated process group for clean killpg
