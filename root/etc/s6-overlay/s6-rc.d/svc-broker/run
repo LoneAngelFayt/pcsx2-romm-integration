@@ -9,13 +9,6 @@ else
     echo "[broker-mod] Python3 already installed: $(python3 --version)"
 fi
 
-echo "[broker-mod] Disabling base-image labwc autostart..."
-AUTOSTART="/config/.config/labwc/autostart"
-if [ -f "$AUTOSTART" ]; then
-    # We empty it rather than delete it, to ensure our override sticks if the base image re-creates it
-    echo "# Disabled by pcsx2-broker-mod" > "$AUTOSTART"
-fi
-
 echo "[broker-mod] Setting broker.py executable..."
 chmod +x /root/broker.py
 

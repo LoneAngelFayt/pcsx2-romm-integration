@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 broker.py — ROM launch broker for linuxserver/pcsx2 container
-Directly launches pcsx2-qt as 'abc' user via s6-setuidgid.
+Launches pcsx2-qt as 'abc' user via s6-setuidgid.
 """
 
 import json
@@ -17,19 +17,18 @@ from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PORT    = int(os.environ.get("BROKER_PORT", "8000"))
-SECRET  = os.environ.get("BROKER_SECRET", "")
+PORT   = int(os.environ.get("BROKER_PORT", "8000"))
+SECRET = os.environ.get("BROKER_SECRET", "")
 
-# Environment for pcsx2-qt
 ENV = {
-    "DISPLAY": ":0",
-    "WAYLAND_DISPLAY": "wayland-1",
-    "XDG_RUNTIME_DIR": "/config/.XDG",
-    "PULSE_RUNTIME_PATH": "/defaults",
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
-    "HOME": "/config",
-    "USER": "abc",
-    "QT_QPA_PLATFORM": "xcb",
+    "DISPLAY":           ":0",
+    "WAYLAND_DISPLAY":   "wayland-1",
+    "XDG_RUNTIME_DIR":   "/config/.XDG",
+    "PULSE_RUNTIME_PATH":"/defaults",
+    "LD_PRELOAD":        "/usr/lib/selkies_joystick_interposer.so",
+    "HOME":              "/config",
+    "USER":              "abc",
+    "QT_QPA_PLATFORM":   "xcb",
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
@@ -46,51 +45,42 @@ log = logging.getLogger("broker")
 
 _session_lock = Lock()
 _session: dict = {
-    "process": None,
-    "rom_path": None,
-    "rom_name": None,
+    "process":    None,
+    "rom_path":   None,
+    "rom_name":   None,
     "started_at": None,
-    "is_managed": False, # If true, we want to keep it running
+    "is_managed": False,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _patch_ini():
-    """Ensure PCSX2 is configured for headless/remote launch."""
     if not INI_PATH.exists():
-        log.warning("PCSX2.ini not found at %s. Skipping patch.", INI_PATH)
+        log.warning("PCSX2.ini not found at %s — skipping patch", INI_PATH)
         return
-
     try:
-        content = INI_PATH.read_text()
-        lines = content.splitlines()
-        new_lines = []
-        
-        # Simple line-by-line replacement for key settings
         patches = {
-            "EnablePINE": "EnablePINE = true",
-            "StartFullscreen": "StartFullscreen = true",
-            "SetupWizardIncomplete": "SetupWizardIncomplete = false",
-            "ConfirmShutdown": "ConfirmShutdown = false",
+            "EnablePINE":          "EnablePINE = true",
+            "StartFullscreen":     "StartFullscreen = true",
+            "SetupWizardIncomplete":"SetupWizardIncomplete = false",
+            "ConfirmShutdown":     "ConfirmShutdown = false",
         }
-        
+        lines = INI_PATH.read_text().splitlines()
         applied = set()
+        new_lines = []
         for line in lines:
             matched = False
             for key, val in patches.items():
-                if line.strip().startswith(f"{key} =") or line.strip() == f"{key}=":
+                if line.strip().startswith(f"{key} =") or line.strip().startswith(f"{key}="):
                     new_lines.append(val)
                     applied.add(key)
                     matched = True
                     break
             if not matched:
                 new_lines.append(line)
-        
-        # Add any missing keys
         for key, val in patches.items():
             if key not in applied:
                 new_lines.append(val)
-        
         INI_PATH.write_text("\n".join(new_lines))
         log.info("PCSX2.ini patched (PINE, Fullscreen, NoWizard)")
     except Exception as exc:
@@ -98,96 +88,94 @@ def _patch_ini():
 
 
 def _kill_pcsx2():
-      with _session_lock:
-          _session["is_managed"] = False
-          proc = _session["process"]
-          _session["process"] = None
-
-      if proc and proc.poll() is None:
-          log.info("Stopping managed PCSX2 process group (PID %d)...",
-  proc.pid)
-          try:
-              pgid = os.getpgid(proc.pid)
-              os.killpg(pgid, signal.SIGTERM) # kill full group
-              try:
-                  proc.wait(timeout=5)
-              except subprocess.TimeoutExpired:
-                  os.killpg(pgid, signal.SIGKILL)
-                  proc.wait()
-          except ProcessLookupError:
-              pass
-
-def _monitor_process(proc, start_time):
-    """Wait for the process to exit, then relaunch dashboard if still managed."""
-    proc.wait()
-    duration = time.monotonic() - start_time
-    
+    """Stop the managed pcsx2-qt process group. Lock is not held during I/O."""
     with _session_lock:
-        # If we didn't intentionally kill it, relaunch into dashboard mode
-        if _session["is_managed"] and _session["process"] == proc:
-            # Backoff if it died too quickly
-            wait_time = 5 if duration < 5 else 1
-            log.info("PCSX2 exited (managed) after %.1fs. Relaunching dashboard in %ds...", duration, wait_time)
-            time.sleep(wait_time)
-            _session["rom_path"] = None
-            _session["rom_name"] = "Dashboard"
-            _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            _launch_pcsx2_internal(None)
+        _session["is_managed"] = False
+        proc = _session["process"]
+        _session["process"] = None
+
+    if proc is None or proc.poll() is not None:
+        return
+
+    log.info("Stopping managed PCSX2 process group (PID %d)...", proc.pid)
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("PCSX2 did not exit after SIGTERM — sending SIGKILL")
+            os.killpg(pgid, signal.SIGKILL)
+            proc.wait()
+    except ProcessLookupError:
+        pass  # already gone
 
 
 def _launch_pcsx2_internal(rom_path):
-    """Launch pcsx2-qt via s6-setuidgid abc."""
-    
-    # Pre-launch fix for Selkies sockets
-    try:
-        subprocess.run("chmod 666 /tmp/selkies* 2>/dev/null || true", shell=True)
-    except:
-        pass
-
-    # Construct command
+    """Exec pcsx2-qt via s6-setuidgid abc. Updates session state inside lock."""
     cmd = ["s6-setuidgid", "abc", "pcsx2-qt"]
-    
     if rom_path:
         cmd.extend(["-batch", "-fullscreen", rom_path])
-    
+
     log.info("Launching: %s", " ".join(cmd))
-    
-    # Prepare environment
     run_env = os.environ.copy()
     run_env.update(ENV)
-    
+
     try:
-        # Launch in background
         proc = subprocess.Popen(
             cmd,
             env=run_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setpgrp # Create new process group
+            preexec_fn=os.setpgrp,  # isolated process group for clean killpg
         )
-        _session["process"] = proc
-        _session["is_managed"] = True
-        log.info("PCSX2 launched with PID %d", proc.pid)
-        
-        # Monitor for exit
-        Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
     except Exception as exc:
         log.error("Failed to launch PCSX2: %s", exc)
-        _session["process"] = None
-        _session["is_managed"] = False
+        return
+
+    with _session_lock:
+        _session["process"] = proc
+        _session["is_managed"] = True
+    log.info("PCSX2 launched with PID %d", proc.pid)
+    Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
+
+
+def _monitor_process(proc, start_time):
+    """Wait for pcsx2-qt to exit; relaunch into dashboard mode if still managed."""
+    proc.wait()
+    duration = time.monotonic() - start_time
+
+    with _session_lock:
+        should_relaunch = _session["is_managed"] and _session["process"] is proc
+
+    if not should_relaunch:
+        return
+
+    wait_time = 5 if duration < 5 else 1
+    log.info("PCSX2 exited after %.1fs — relaunching dashboard in %ds", duration, wait_time)
+    time.sleep(wait_time)
+
+    with _session_lock:
+        # Re-check: a concurrent _kill_pcsx2 could have fired during sleep
+        if not _session["is_managed"]:
+            return
+        _session["rom_path"] = None
+        _session["rom_name"] = "Dashboard"
+        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    _launch_pcsx2_internal(None)
 
 
 def _launch_pcsx2(rom_path):
-    """Stop existing, patch, and launch new."""
+    """Kill existing instance, patch INI, update session metadata, launch."""
     _kill_pcsx2()
     _patch_ini()
     time.sleep(1)
-    
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
         _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _launch_pcsx2_internal(rom_path)
+    _launch_pcsx2_internal(rom_path)
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -225,11 +213,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
         elif self.path == "/status":
             with _session_lock:
-                active = _session["process"] is not None and _session["process"].poll() is None
+                active = (
+                    _session["process"] is not None
+                    and _session["process"].poll() is None
+                )
                 self._send_json(200, {
-                    "active": active,
-                    "rom_path": _session["rom_path"] if active else None,
-                    "rom_name": _session["rom_name"] if active else None,
+                    "active":     active,
+                    "rom_path":   _session["rom_path"]   if active else None,
+                    "rom_name":   _session["rom_name"]   if active else None,
                     "started_at": _session["started_at"] if active else None,
                 })
         else:
@@ -249,7 +240,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not rom_path:
             self._send_json(400, {"error": "rom_path is required"})
             return
-
         if not Path(rom_path).exists():
             self._send_json(422, {"error": "rom_path does not exist", "path": rom_path})
             return
@@ -265,11 +255,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden"})
             return
 
-        def _task():
-            log.info("Soft reset: returning to dashboard")
-            _launch_pcsx2(None)
-
-        Thread(target=_task, daemon=True).start()
+        Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
+        log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
 
     def do_OPTIONS(self):
@@ -283,9 +270,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Starting broker in 5s (waiting for desktop)...")
+    log.info("Broker starting — waiting 5s for desktop...")
     time.sleep(5)
-    
+
+    # Kill any pcsx2-qt instances left over from the labwc autostart or previous runs.
+    # init-pcsx2-config disables the autostart before labwc reads it, but this is a
+    # safety net in case of stale processes (e.g., on a hot-reload without full restart).
+    result = subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+    if result.returncode == 0:
+        log.info("Killed stale pcsx2-qt instance(s) on startup.")
+        time.sleep(2)
+
+    _patch_ini()
+    _launch_pcsx2_internal(None)
+
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
     if SECRET:
