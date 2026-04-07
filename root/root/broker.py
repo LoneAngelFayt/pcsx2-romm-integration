@@ -98,27 +98,24 @@ def _patch_ini():
 
 
 def _kill_pcsx2():
-    """Stop any running pcsx2-qt instance."""
-    with _session_lock:
-        _session["is_managed"] = False
-        if _session["process"] and _session["process"].poll() is None:
-            log.info("Stopping managed PCSX2 process (PID %d)...", _session["process"].pid)
-            _session["process"].terminate()
-            try:
-                _session["process"].wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _session["process"].kill()
-        _session["process"] = None
+      with _session_lock:
+          _session["is_managed"] = False
+          proc = _session["process"]
+          _session["process"] = None
 
-    # Also kill any unmanaged instances just in case
-    try:
-        subprocess.run(["pkill", "-15", "-f", "pcsx2-qt"], capture_output=True)
-        time.sleep(1)
-        # Force kill if still there
-        subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
-    except Exception as exc:
-        log.warning("Error during pkill: %s", exc)
-
+      if proc and proc.poll() is None:
+          log.info("Stopping managed PCSX2 process group (PID %d)...",
+  proc.pid)
+          try:
+              pgid = os.getpgid(proc.pid)
+              os.killpg(pgid, signal.SIGTERM) # kill full group
+              try:
+                  proc.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  os.killpg(pgid, signal.SIGKILL)
+                  proc.wait()
+          except ProcessLookupError:
+              pass
 
 def _monitor_process(proc, start_time):
     """Wait for the process to exit, then relaunch dashboard if still managed."""
