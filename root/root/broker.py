@@ -260,6 +260,26 @@ def _recv_exact(s: _socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _find_pine_socket() -> Path | None:
+    """Locate PCSX2's PINE Unix socket. Tries the configured path first, then
+    falls back to a glob search so the correct name is discovered automatically."""
+    if PINE_SOCKET.exists():
+        return PINE_SOCKET
+    runtime_dir = Path(ENV["XDG_RUNTIME_DIR"])
+    for pattern in ("pcsx2-*", "pcsx2.sock"):
+        found = sorted(runtime_dir.glob(pattern))
+        if found:
+            log.info("PINE: configured path %s absent — using %s", PINE_SOCKET, found[0])
+            return found[0]
+    for pattern in ("pcsx2-*", "pcsx2.sock"):
+        found = sorted(Path("/tmp").glob(pattern))
+        if found:
+            log.info("PINE: found socket in /tmp at %s", found[0])
+            return found[0]
+    log.error("PINE: no socket found (looked in %s and /tmp)", runtime_dir)
+    return None
+
+
 def _pine_save_state(slot: int) -> bool:
     """Send MsgSaveState (opcode 9) to PCSX2 via the PINE Unix socket.
 
@@ -267,12 +287,15 @@ def _pine_save_state(slot: int) -> bool:
     Response:    [uint32 LE: 0] (empty body — save is fire-and-ack)
     Returns True if PCSX2 acknowledged the command.
     """
+    socket_path = _find_pine_socket()
+    if socket_path is None:
+        return False
     payload = bytes([9, slot & 0xFF])
     msg = struct.pack("<I", len(payload)) + payload
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
             s.settimeout(PINE_TIMEOUT)
-            s.connect(str(PINE_SOCKET))
+            s.connect(str(socket_path))
             s.sendall(msg)
             resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
             if resp_len > 0:
@@ -388,6 +411,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     with _session_lock:
                         _session["save_in_progress"] = False
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+                # Relaunch to dashboard after save — same path as DELETE /launch.
+                Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
             else:
                 def _bg(s):
                     try:
@@ -395,6 +420,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     finally:
                         with _session_lock:
                             _session["save_in_progress"] = False
+                    # Relaunch to dashboard after save — same path as DELETE /launch.
+                    _launch_pcsx2(None)
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 # Session state is not yet cleared when this response is sent;
                 # callers polling /status immediately may observe stale state.
