@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-broker.py — ROM launch broker for linuxserver/pcsx2 container
-Launches pcsx2-qt as 'abc' user via sudo+env.
-"""
+"""broker.py — launch PCSX2 on demand and expose a small HTTP API."""
 
 import glob
 import json
@@ -89,7 +86,7 @@ def _patch_ini():
 
 
 def _kill_pcsx2():
-    """Stop the managed pcsx2-qt process group. Lock is not held during I/O."""
+    """Kill the managed pcsx2-qt process group. Lock is released before waiting."""
     with _session_lock:
         _session["is_managed"] = False
         proc = _session["process"]
@@ -98,7 +95,7 @@ def _kill_pcsx2():
     if proc is None or proc.poll() is not None:
         return
 
-    log.info("Stopping managed PCSX2 process group (PID %d)...", proc.pid)
+    log.info("Stopping PCSX2 (PID %d)...", proc.pid)
     try:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
@@ -113,7 +110,7 @@ def _kill_pcsx2():
 
 
 def _launch_pcsx2_internal(rom_path):
-    """Launch pcsx2-qt as abc via sudo+env (inline env vars bypass sudo's env scrubbing)."""
+    """Launch pcsx2-qt as abc via sudo+env. Inline env vars bypass sudo's env scrubbing."""
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
@@ -129,7 +126,7 @@ def _launch_pcsx2_internal(rom_path):
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setpgrp,  # isolated process group for clean killpg
+            preexec_fn=os.setpgrp,  # own process group so killpg is clean
         )
     except Exception as exc:
         log.error("Failed to launch PCSX2: %s", exc)
@@ -138,12 +135,12 @@ def _launch_pcsx2_internal(rom_path):
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
-    log.info("PCSX2 launched with PID %d", proc.pid)
+    log.info("PCSX2 launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
 
 def _monitor_process(proc, start_time):
-    """Wait for pcsx2-qt to exit; relaunch into dashboard mode if still managed."""
+    """On unexpected exit, relaunch into dashboard mode if the session is still managed."""
     proc.wait()
     duration = time.monotonic() - start_time
 
@@ -153,12 +150,13 @@ def _monitor_process(proc, start_time):
     if not should_relaunch:
         return
 
+    # Back off if the process died almost immediately to avoid a tight crash loop.
     wait_time = 5 if duration < 5 else 1
     log.info("PCSX2 exited after %.1fs — relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
 
     with _session_lock:
-        # Re-check: a concurrent _kill_pcsx2 could have fired during sleep
+        # Re-check: _kill_pcsx2 may have fired during the sleep above.
         if not _session["is_managed"]:
             return
         _session["rom_path"] = None
@@ -169,24 +167,21 @@ def _monitor_process(proc, start_time):
 
 
 def _drain_gamepad_sockets():
-    """Send EOF to every selkies gamepad socket before a new ROM launch.
+    """Send EOF to each selkies gamepad socket before launching a new session.
 
-    The selkies input_handler accepts connections in two phases:
-      1. Sends config payload, then awaits a 1-byte arch specifier from the client.
-      2. Enters a keep-alive loop: while self.running and not writer.is_closing().
+    The selkies input_handler has two phases per connection:
+      1. Sends config payload, awaits a 1-byte arch specifier from the client.
+      2. Keep-alive loop: while self.running and not writer.is_closing().
 
-    For any handler currently waiting in phase 1 (awaiting the arch byte), our
-    connect + immediate SHUT_WR causes readexactly(1) to raise IncompleteReadError.
-    The handler exits cleanly and removes itself from the active client list.
+    Connecting and immediately sending SHUT_WR causes readexactly(1) in phase 1
+    to raise IncompleteReadError — the handler exits and removes itself from the
+    active client list without ever entering phase 2.
 
-    Phase-2 handlers are not fixed by this drain — their keep-alive loop has no
-    EOF check, so they remain until selkies restarts or the reader.at_eof() patch
-    is active (applied by init-pcsx2-config, effective after a full image rebuild).
-    The asyncio server continues accepting new connections independently of any
-    stuck phase-2 handler, so this drain still clears the slot for the incoming
-    interposer connection.
+    Phase-2 handlers are unaffected; their loop has no EOF check. They clear on
+    selkies restart or once the reader.at_eof() patch is active (applied by
+    init-pcsx2-config, requires image rebuild to take effect).
 
-    Socket files that refuse connection are dead remnants and are unlinked.
+    Socket files that refuse connection are stale and are unlinked.
     """
     paths = sorted(
         glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
@@ -202,8 +197,6 @@ def _drain_gamepad_sockets():
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
                 s.settimeout(0.3)
                 s.connect(path)
-                # Half-close write side — handler's readexactly(1) raises
-                # IncompleteReadError and the handler exits cleanly.
                 s.shutdown(_socket.SHUT_WR)
             drained += 1
         except OSError:
@@ -220,13 +213,10 @@ def _drain_gamepad_sockets():
 
 
 def _launch_pcsx2(rom_path):
-    """Kill existing instance, drain sockets, patch INI, update session metadata, launch."""
     _kill_pcsx2()
     _drain_gamepad_sockets()
     _patch_ini()
-    # Allow drained handlers time to exit and the kill to fully settle
-    # before writing the INI and starting a new process.
-    time.sleep(1)
+    time.sleep(1)  # let drained handlers exit and the kill settle before launching
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
@@ -235,11 +225,9 @@ def _launch_pcsx2(rom_path):
 
 
 def _cleanup_sockets():
-    """Restart the selkies service to flush all accumulated stale gamepad socket
-    connections. The selkies asyncio handler doesn't detect half-closed Unix
-    sockets on idle gamepad slots, so connections accumulate until restarted.
-    s6-overlay automatically brings selkies back within a few seconds."""
-    log.info("Socket cleanup: restarting selkies to flush stale gamepad connections...")
+    """Restart selkies to flush all stale gamepad connections.
+    s6-overlay brings it back automatically within a few seconds."""
+    log.info("Socket cleanup: restarting selkies...")
     result = subprocess.run(["pkill", "-15", "-f", "selkies"], capture_output=True)
     if result.returncode == 0:
         log.info("Socket cleanup: selkies stopped, s6 will restart it shortly.")
@@ -348,9 +336,8 @@ def main():
     log.info("Broker starting — waiting 5s for desktop...")
     time.sleep(5)
 
-    # Kill any pcsx2-qt instances left over from the labwc autostart or previous runs.
-    # init-pcsx2-config disables the autostart before labwc reads it, but this is a
-    # safety net in case of stale processes (e.g., on a hot-reload without full restart).
+    # Safety net for stale processes on hot-reload; init-pcsx2-config already
+    # disables the labwc autostart so this should normally find nothing.
     result = subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale pcsx2-qt instance(s) on startup.")
