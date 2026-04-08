@@ -4,10 +4,12 @@ broker.py — ROM launch broker for linuxserver/pcsx2 container
 Launches pcsx2-qt as 'abc' user via sudo+env.
 """
 
+import glob
 import json
 import logging
 import os
 import signal
+import socket as _socket
 import subprocess
 import sys
 import time
@@ -166,10 +168,64 @@ def _monitor_process(proc, start_time):
     _launch_pcsx2_internal(None)
 
 
+def _drain_gamepad_sockets():
+    """Send EOF to every selkies gamepad socket before a new ROM launch.
+
+    The selkies input_handler accepts connections in two phases:
+      1. Sends config payload, then awaits a 1-byte arch specifier from the client.
+      2. Enters a keep-alive loop: while self.running and not writer.is_closing().
+
+    For any handler currently waiting in phase 1 (awaiting the arch byte), our
+    connect + immediate SHUT_WR causes readexactly(1) to raise IncompleteReadError.
+    The handler exits cleanly and removes itself from the active client list.
+
+    Phase-2 handlers are not fixed by this drain — their keep-alive loop has no
+    EOF check, so they remain until selkies restarts or the reader.at_eof() patch
+    is active (applied by init-pcsx2-config, effective after a full image rebuild).
+    The asyncio server continues accepting new connections independently of any
+    stuck phase-2 handler, so this drain still clears the slot for the incoming
+    interposer connection.
+
+    Socket files that refuse connection are dead remnants and are unlinked.
+    """
+    paths = sorted(
+        glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
+    )
+    if not paths:
+        log.info("Socket drain: no gamepad sockets found.")
+        return
+
+    drained = 0
+    removed = 0
+    for path in paths:
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                s.connect(path)
+                # Half-close write side — handler's readexactly(1) raises
+                # IncompleteReadError and the handler exits cleanly.
+                s.shutdown(_socket.SHUT_WR)
+            drained += 1
+        except OSError:
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+
+    log.info(
+        "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
+        drained, removed, len(paths),
+    )
+
+
 def _launch_pcsx2(rom_path):
-    """Kill existing instance, patch INI, update session metadata, launch."""
+    """Kill existing instance, drain sockets, patch INI, update session metadata, launch."""
     _kill_pcsx2()
+    _drain_gamepad_sockets()
     _patch_ini()
+    # Allow drained handlers time to exit and the kill to fully settle
+    # before writing the INI and starting a new process.
     time.sleep(1)
     with _session_lock:
         _session["rom_path"] = rom_path
