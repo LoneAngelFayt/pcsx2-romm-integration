@@ -102,7 +102,7 @@ def _patch_ini():
                 log.warning("PCSX2.ini: %s not found — appending without section header", key)
                 new_lines.append(val)
         INI_PATH.write_text("\n".join(new_lines) + "\n")
-        log.info("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown)")
+        log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown)")
     except Exception as exc:
         log.error("Failed to patch PCSX2.ini: %s", exc)
 
@@ -143,7 +143,8 @@ def _launch_pcsx2_internal(rom_path):
         # treated as a pcsx2-qt flag.
         cmd.extend(["-batch", "-fullscreen", "--", rom_path])
 
-    log.info("Launching: %s", " ".join(cmd))
+    log.info("Launching PCSX2 (rom=%s)", rom_path or "dashboard")
+    log.debug("Launching: %s", " ".join(cmd))
 
     try:
         proc = subprocess.Popen(
@@ -213,7 +214,7 @@ def _drain_gamepad_sockets():
         glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
     )
     if not paths:
-        log.info("Socket drain: no gamepad sockets found.")
+        log.debug("Socket drain: no gamepad sockets found.")
         return
 
     drained = 0
@@ -232,7 +233,7 @@ def _drain_gamepad_sockets():
             except OSError:
                 pass
 
-    log.info(
+    log.debug(
         "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
         drained, removed, len(paths),
     )
@@ -270,12 +271,12 @@ def _find_pine_socket() -> Path | None:
     for pattern in ("pcsx2-*", "pcsx2.sock"):
         found = sorted(runtime_dir.glob(pattern))
         if found:
-            log.info("PINE: configured path %s absent — using %s", PINE_SOCKET, found[0])
+            log.debug("PINE: configured path %s absent — using %s", PINE_SOCKET, found[0])
             return found[0]
     for pattern in ("pcsx2-*", "pcsx2.sock"):
         found = sorted(Path("/tmp").glob(pattern))
         if found:
-            log.info("PINE: found socket in /tmp at %s", found[0])
+            log.debug("PINE: found socket in /tmp at %s", found[0])
             return found[0]
     log.error("PINE: no socket found (looked in %s and /tmp)", runtime_dir)
     return None
