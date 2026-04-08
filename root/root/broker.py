@@ -37,7 +37,8 @@ INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
 # PCSX2 2.x creates the PINE socket as pcsx2.sock (not pcsx2-{slot})
 PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
-PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "15.0"))
+PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "5.0"))   # connect + send only
+PINE_WAIT    = float(os.environ.get("PINE_WAIT",    "3.0"))   # post-send settle before kill
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
@@ -286,8 +287,13 @@ def _pine_save_state(slot: int) -> bool:
     """Send MsgSaveState (opcode 9) to PCSX2 via the PINE Unix socket.
 
     Wire format: [uint32 LE: payload length] [0x09] [slot byte]
-    Response:    [uint32 LE: 0] (empty body — save is fire-and-ack)
-    Returns True if PCSX2 acknowledged the command.
+
+    PCSX2 2.x processes the save asynchronously and closes the socket without
+    sending a response, so we do not block waiting for one. After the command
+    is sent we sleep PINE_WAIT seconds to let the disk write complete before
+    the caller kills the process.
+
+    Returns True if the command was successfully sent.
     """
     socket_path = _find_pine_socket()
     if socket_path is None:
@@ -300,14 +306,25 @@ def _pine_save_state(slot: int) -> bool:
             s.settimeout(PINE_TIMEOUT)
             s.connect(str(socket_path))
             s.sendall(msg)
-            resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
-            if resp_len > 0:
-                _recv_exact(s, resp_len)
-        log.info("PINE: save state to slot %d OK", slot)
-        return True
+            # Signal end-of-batch so PCSX2 stops reading and processes the command.
+            # Without SHUT_WR, the PINE server waits for more data indefinitely.
+            s.shutdown(_socket.SHUT_WR)
+            # Read response if PCSX2 sends one; handle gracefully if it doesn't.
+            try:
+                resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
+                if resp_len > 0:
+                    _recv_exact(s, resp_len)
+                log.debug("PINE: save state slot %d acknowledged", slot)
+            except Exception:
+                log.debug("PINE: no response for slot %d after SHUT_WR", slot)
     except Exception as exc:
-        log.error("PINE save state (slot %d) failed: %s", slot, exc)
+        log.error("PINE save state (slot %d) failed to send: %s", slot, exc)
         return False
+
+    # Give PCSX2 time to finish writing the save file before the caller kills it.
+    log.info("PINE: save command sent (slot %d) — waiting %.1fs for write", slot, PINE_WAIT)
+    time.sleep(PINE_WAIT)
+    return True
 
 
 def _save_and_exit(slot: int) -> bool:
