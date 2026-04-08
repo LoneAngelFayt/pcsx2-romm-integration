@@ -82,8 +82,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
           provenance: false
+          outputs: type=registry,compression=gzip,force-compression=true
           tags: |
             ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:latest
             ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:v${{ steps.version.outputs.full }}
