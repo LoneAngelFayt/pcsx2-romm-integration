@@ -1,0 +1,1 @@
+root ALL=(abc) NOPASSWD: /usr/bin/env

@@ -2,6 +2,7 @@
 """broker.py — launch PCSX2 on demand and expose a small HTTP API."""
 
 import glob
+import hmac
 import json
 import logging
 import os
@@ -16,8 +17,9 @@ from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PORT   = int(os.environ.get("BROKER_PORT", "8000"))
-SECRET = os.environ.get("BROKER_SECRET", "")
+PORT     = int(os.environ.get("BROKER_PORT", "8000"))
+SECRET   = os.environ.get("BROKER_SECRET", "")
+ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
 ENV = {
     "DISPLAY":           ":0",
@@ -53,6 +55,17 @@ _session: dict = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _validate_rom_path(raw: str) -> Path | None:
+    """Resolve raw to an absolute path and confirm it lives under ROM_ROOT."""
+    try:
+        p = Path(raw).resolve()
+    except (ValueError, OSError):
+        return None
+    if not p.is_relative_to(ROM_ROOT):
+        return None
+    return p
+
+
 def _patch_ini():
     if not INI_PATH.exists():
         log.warning("PCSX2.ini not found at %s — skipping patch", INI_PATH)
@@ -78,8 +91,9 @@ def _patch_ini():
                 new_lines.append(line)
         for key, val in patches.items():
             if key not in applied:
+                log.warning("PCSX2.ini: %s not found — appending without section header", key)
                 new_lines.append(val)
-        INI_PATH.write_text("\n".join(new_lines))
+        INI_PATH.write_text("\n".join(new_lines) + "\n")
         log.info("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown)")
     except Exception as exc:
         log.error("Failed to patch PCSX2.ini: %s", exc)
@@ -117,7 +131,9 @@ def _launch_pcsx2_internal(rom_path):
         "pcsx2-qt",
     ]
     if rom_path:
-        cmd.extend(["-batch", "-fullscreen", rom_path])
+        # '--' terminates option parsing so a path that starts with '-' isn't
+        # treated as a pcsx2-qt flag.
+        cmd.extend(["-batch", "-fullscreen", "--", rom_path])
 
     log.info("Launching: %s", " ".join(cmd))
 
@@ -130,6 +146,9 @@ def _launch_pcsx2_internal(rom_path):
         )
     except Exception as exc:
         log.error("Failed to launch PCSX2: %s", exc)
+        with _session_lock:
+            _session["process"] = None
+            _session["is_managed"] = False
         return
 
     with _session_lock:
@@ -245,7 +264,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _check_secret(self) -> bool:
         if not SECRET:
             return True
-        return self.headers.get("X-Broker-Secret", "") == SECRET
+        return hmac.compare_digest(
+            self.headers.get("X-Broker-Secret", ""),
+            SECRET,
+        )
 
     def _send_json(self, code: int, body: dict) -> None:
         payload = json.dumps(body).encode()
@@ -274,12 +296,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _session["process"] is not None
                     and _session["process"].poll() is None
                 )
-                self._send_json(200, {
-                    "active":     active,
-                    "rom_path":   _session["rom_path"]   if active else None,
-                    "rom_name":   _session["rom_name"]   if active else None,
-                    "started_at": _session["started_at"] if active else None,
-                })
+                snap = dict(_session) if active else {}
+            self._send_json(200, {
+                "active":     active,
+                "rom_path":   snap.get("rom_path")   if active else None,
+                "rom_name":   snap.get("rom_name")   if active else None,
+                "started_at": snap.get("started_at") if active else None,
+            })
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -298,17 +321,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
-        rom_path = body.get("rom_path", "").strip()
+        raw_path = body.get("rom_path", "").strip()
 
-        if not rom_path:
+        if not raw_path:
             self._send_json(400, {"error": "rom_path is required"})
             return
-        if not Path(rom_path).exists():
-            self._send_json(422, {"error": "rom_path does not exist", "path": rom_path})
+
+        rom_path = _validate_rom_path(raw_path)
+        if rom_path is None:
+            self._send_json(400, {
+                "error": "rom_path must be within ROM_ROOT",
+                "rom_root": str(ROM_ROOT),
+            })
+            return
+        if not rom_path.exists():
+            self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
             return
 
-        Thread(target=_launch_pcsx2, args=(rom_path,), daemon=True).start()
-        self._send_json(200, {"status": "launching", "rom_path": rom_path})
+        Thread(target=_launch_pcsx2, args=(str(rom_path),), daemon=True).start()
+        self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
     def do_DELETE(self):
         if not self._check_secret():

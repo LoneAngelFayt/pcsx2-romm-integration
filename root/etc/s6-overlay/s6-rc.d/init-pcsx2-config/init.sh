@@ -1,17 +1,26 @@
 #!/usr/bin/with-contenv bash
 
-# 1. Disable the base-image labwc autostart before labwc reads it.
-#    The broker manages pcsx2-qt directly; the autostart must not also launch it.
+# Ensure python3 is available for the broker service.
+if ! command -v python3 &>/dev/null; then
+    echo "[broker-mod] Installing python3..."
+    apt-get update -qq && apt-get install -y -qq python3 \
+        || echo "[broker-mod] ERROR: failed to install python3"
+fi
+
+# Lock down the sudoers rule so sudo accepts it (requires mode 0440).
+chmod 0440 /etc/sudoers.d/broker
+echo "[broker-mod] sudoers rule set."
+
+# Disable the labwc autostart so pcsx2-qt isn't launched a second time by the
+# desktop session — the broker manages the process lifecycle directly.
 AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
 printf '# Disabled by pcsx2-broker-mod\n' > "$AUTOSTART"
 echo "[broker-mod] Disabled labwc autostart."
 
-# 2. Patch the selkies input_handler.py keep-alive loop to also check reader.at_eof().
-#    Without this patch, idle gamepad sockets (virtual slots 1-3) never detect client
-#    disconnection: asyncio buffers EOF but eof_received() returns True for non-SSL
-#    Unix sockets, so the transport stays open and writer.is_closing() never flips.
-#    Adding reader.at_eof() causes the loop to exit as soon as the client half-closes.
+# Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
+# Without this, idle gamepad sockets never detect client disconnection because
+# asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
 INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
 if [ -f "$INPUT_HANDLER" ]; then
     if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
@@ -19,7 +28,8 @@ if [ -f "$INPUT_HANDLER" ]; then
     else
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
-            "$INPUT_HANDLER"
+            "$INPUT_HANDLER" \
+            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
         echo "[broker-mod] Patched selkies input_handler.py EOF detection."
     fi
 else

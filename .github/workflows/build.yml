@@ -36,8 +36,8 @@ jobs:
       - name: Update Floating Tags (vX.Y & latest)
         if: steps.semantic.outputs.new_release_published == 'true'
         run: |
-          NEW_VER=${{ steps.semantic.outputs.new_release_version }}
-          MINOR_VER=$(echo $NEW_VER | cut -d. -f1-2)
+          NEW_VER="${{ steps.semantic.outputs.new_release_version }}"
+          MINOR_VER=$(echo "$NEW_VER" | cut -d. -f1-2)
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -66,8 +66,8 @@ jobs:
       - name: Extract minor version
         id: version
         run: |
-          FULL=${{ needs.release.outputs.new_release_version }}
-          MINOR=$(echo $FULL | cut -d. -f1-2)
+          FULL="${{ needs.release.outputs.new_release_version }}"
+          MINOR=$(echo "$FULL" | cut -d. -f1-2)
           echo "full=$FULL" >> $GITHUB_OUTPUT
           echo "minor=$MINOR" >> $GITHUB_OUTPUT
 
