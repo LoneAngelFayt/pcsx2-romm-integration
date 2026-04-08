@@ -83,6 +83,7 @@ jobs:
         with:
           context: .
           push: true
+          provenance: false
           tags: |
             ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:latest
             ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:v${{ steps.version.outputs.full }}
