@@ -1,27 +1,37 @@
 #!/usr/bin/with-contenv bash
 
-INI="/config/.config/PCSX2/inis/PCSX2.ini"
-
-# Wait for the ini file to exist (written on first PCSX2 launch)
-echo "[broker-mod] Waiting for PCSX2.ini..."
-for i in $(seq 1 30); do
-    if [ -f "$INI" ]; then
-        break
-    fi
-    sleep 1
-done
-
-if [ ! -f "$INI" ]; then
-    echo "[broker-mod] PCSX2.ini not found, skipping config patch"
-    exit 0
+# Ensure python3 is available for the broker service.
+if ! command -v python3 &>/dev/null; then
+    echo "[broker-mod] Installing python3..."
+    apt-get update -qq && apt-get install -y -qq python3 \
+        || echo "[broker-mod] ERROR: failed to install python3"
 fi
 
-echo "[broker-mod] Patching PCSX2.ini..."
+# Lock down the sudoers rule so sudo accepts it (requires mode 0440).
+chmod 0440 /etc/sudoers.d/broker
+echo "[broker-mod] sudoers rule set."
 
-# Enable PINE IPC
-sed -i 's/EnablePINE=false/EnablePINE=true/' "$INI"
+# Disable the labwc autostart so pcsx2-qt isn't launched a second time by the
+# desktop session — the broker manages the process lifecycle directly.
+AUTOSTART="/config/.config/labwc/autostart"
+mkdir -p "$(dirname "$AUTOSTART")"
+printf '# Disabled by pcsx2-broker-mod\n' > "$AUTOSTART"
+echo "[broker-mod] Disabled labwc autostart."
 
-# Fix setup wizard blocking launch
-# sed -i 's/SetupWizardIncomplete=true/SetupWizardIncomplete=false/' "$INI"
-
-echo "[broker-mod] PCSX2.ini patched — PINE enabled on slot 28011"
+# Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
+# Without this, idle gamepad sockets never detect client disconnection because
+# asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
+INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
+if [ -f "$INPUT_HANDLER" ]; then
+    if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
+        echo "[broker-mod] selkies input_handler.py already patched."
+    else
+        sed -i \
+            's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
+            "$INPUT_HANDLER" \
+            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
+        echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+    fi
+else
+    echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
+fi

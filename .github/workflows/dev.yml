@@ -32,4 +32,5 @@ jobs:
         with:
           context: .
           push: true
+          provenance: false
           tags: ghcr.io/${{ steps.owner.outputs.name }}/pcsx2-romm-integration-mod:dev
