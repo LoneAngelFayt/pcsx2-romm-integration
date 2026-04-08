@@ -35,10 +35,11 @@ ENV = {
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
-PINE_SLOT    = int(os.environ.get("PINE_SLOT", "28011"))
-PINE_SOCKET  = Path(ENV["XDG_RUNTIME_DIR"]) / f"pcsx2-{PINE_SLOT}"
-PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "5.0"))
+# PCSX2 2.x creates the PINE socket as pcsx2.sock (not pcsx2-{slot})
+PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
+PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "15.0"))
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
+SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -290,6 +291,7 @@ def _pine_save_state(slot: int) -> bool:
     socket_path = _find_pine_socket()
     if socket_path is None:
         return False
+    # MsgSaveState opcode = 9 per PCSX2 PINE IPC spec (pcsx2/PINE.cpp)
     payload = bytes([9, slot & 0xFF])
     msg = struct.pack("<I", len(payload)) + payload
     try:
@@ -410,17 +412,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 finally:
                     with _session_lock:
                         _session["save_in_progress"] = False
+                if not ok:
+                    log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
-                # Relaunch to dashboard after save — same path as DELETE /launch.
+                # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
                 Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
             else:
                 def _bg(s):
                     try:
-                        _save_and_exit(s)
+                        ok = _save_and_exit(s)
                     finally:
                         with _session_lock:
                             _session["save_in_progress"] = False
-                    # Relaunch to dashboard after save — same path as DELETE /launch.
+                    if not ok:
+                        log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", s)
+                    # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
                     _launch_pcsx2(None)
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 # Session state is not yet cleared when this response is sent;
