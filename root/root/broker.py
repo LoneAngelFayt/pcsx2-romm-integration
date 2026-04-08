@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import socket as _socket
+import struct
 import subprocess
 import sys
 import time
@@ -34,6 +35,11 @@ ENV = {
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
+PINE_SLOT    = int(os.environ.get("PINE_SLOT", "28011"))
+PINE_SOCKET  = Path(ENV["XDG_RUNTIME_DIR"]) / f"pcsx2-{PINE_SLOT}"
+PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "5.0"))
+SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [broker] %(levelname)s %(message)s",
@@ -46,11 +52,12 @@ log = logging.getLogger("broker")
 
 _session_lock = Lock()
 _session: dict = {
-    "process":    None,
-    "rom_path":   None,
-    "rom_name":   None,
-    "started_at": None,
-    "is_managed": False,
+    "process":          None,
+    "rom_path":         None,
+    "rom_name":         None,
+    "started_at":       None,
+    "is_managed":       False,
+    "save_in_progress": False,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -242,6 +249,48 @@ def _launch_pcsx2(rom_path):
     _launch_pcsx2_internal(rom_path)
 
 
+def _recv_exact(s: _socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from a socket, accumulating across partial reads."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"PINE: socket closed after {len(buf)}/{n} bytes")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _pine_save_state(slot: int) -> bool:
+    """Send MsgSaveState (opcode 9) to PCSX2 via the PINE Unix socket.
+
+    Wire format: [uint32 LE: payload length] [0x09] [slot byte]
+    Response:    [uint32 LE: 0] (empty body — save is fire-and-ack)
+    Returns True if PCSX2 acknowledged the command.
+    """
+    payload = bytes([9, slot & 0xFF])
+    msg = struct.pack("<I", len(payload)) + payload
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(PINE_TIMEOUT)
+            s.connect(str(PINE_SOCKET))
+            s.sendall(msg)
+            resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
+            if resp_len > 0:
+                _recv_exact(s, resp_len)
+        log.info("PINE: save state to slot %d OK", slot)
+        return True
+    except Exception as exc:
+        log.error("PINE save state (slot %d) failed: %s", slot, exc)
+        return False
+
+
+def _save_and_exit(slot: int) -> bool:
+    """Save emulator state then kill PCSX2. Returns True if save succeeded."""
+    ok = _pine_save_state(slot)
+    _kill_pcsx2()
+    return ok
+
+
 def _cleanup_sockets():
     """Restart selkies to flush all stale gamepad connections.
     s6-overlay brings it back automatically within a few seconds."""
@@ -315,9 +364,51 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "cleanup started"})
             return
 
+        if self.path == "/save-and-exit":
+            with _session_lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
+                _session["save_in_progress"] = True
+            body = self._read_body()
+            slot = body.get("slot", SAVE_SLOT)
+            if not isinstance(slot, int) or not (0 <= slot <= 9):
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                self._send_json(400, {"error": "slot must be 0–9"})
+                return
+            wait = body.get("wait", True)
+            if wait:
+                try:
+                    ok = _save_and_exit(slot)
+                finally:
+                    with _session_lock:
+                        _session["save_in_progress"] = False
+                self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+            else:
+                def _bg(s):
+                    try:
+                        _save_and_exit(s)
+                    finally:
+                        with _session_lock:
+                            _session["save_in_progress"] = False
+                Thread(target=_bg, args=(slot,), daemon=True).start()
+                # Session state is not yet cleared when this response is sent;
+                # callers polling /status immediately may observe stale state.
+                self._send_json(200, {"status": "queued", "slot": slot})
+            return
+
         if self.path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
+
+        with _session_lock:
+            if _session["save_in_progress"]:
+                self._send_json(409, {"error": "save in progress"})
+                return
 
         body = self._read_body()
         raw_path = body.get("rom_path", "").strip()
