@@ -197,8 +197,7 @@ def _drain_gamepad_sockets():
     active client list without ever entering phase 2.
 
     Phase-2 handlers are unaffected; their loop has no EOF check. They clear on
-    selkies restart or once the reader.at_eof() patch is active (applied by
-    init-pcsx2-config, requires image rebuild to take effect).
+    selkies restart or once the reader.at_eof() patch is active
 
     Socket files that refuse connection are stale and are unlinked.
     """
