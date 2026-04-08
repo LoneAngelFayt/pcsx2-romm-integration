@@ -241,7 +241,7 @@ def _launch_pcsx2(rom_path):
     _kill_pcsx2()
     _drain_gamepad_sockets()
     _patch_ini()
-    time.sleep(1)  # let drained handlers exit and the kill settle before launching
+    time.sleep(2)  # let drained handlers exit and the kill settle before launching
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
