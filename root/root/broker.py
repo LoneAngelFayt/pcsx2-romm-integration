@@ -43,7 +43,7 @@ SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [broker] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
@@ -286,6 +286,7 @@ def _find_pine_socket() -> Path | None:
 def _sstate_snapshot() -> dict:
     """Return {Path: (size, mtime)} for every .p2s file currently in SSTATE_DIR."""
     if not SSTATE_DIR.is_dir():
+        log.debug("PINE: SSTATE_DIR absent — %s", SSTATE_DIR)
         return {}
     snap = {}
     for p in SSTATE_DIR.glob("*.p2s"):
@@ -294,6 +295,7 @@ def _sstate_snapshot() -> dict:
             snap[p] = (st.st_size, st.st_mtime)
         except OSError:
             pass
+    log.debug("PINE: snapshot — %d file(s) in %s", len(snap), SSTATE_DIR)
     return snap
 
 
@@ -324,8 +326,10 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
                     target = p
                     last_size = size
                     stable_since = time.monotonic()
-                    log.debug("PINE: write detected — %s (%d bytes)", p.name, size)
+                    log.debug("PINE: write detected — %s (%d bytes, mtime %.3f)", p.name, size, mtime)
                     break
+                else:
+                    log.debug("PINE: %s unchanged (mtime %.3f)", p.name, mtime)
         else:
             cur = after.get(target)
             if cur is None:
