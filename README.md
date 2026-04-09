@@ -64,8 +64,8 @@ docker compose up -d --force-recreate pcsx2
 | `BROKER_PORT` | `8000` | Port the broker HTTP server listens on. |
 | `ROM_ROOT` | `/romm/library` | Root path inside the container where ROMs are mounted. Requests with a `rom_path` outside this directory are rejected. |
 | `PINE_SOCKET` | `/config/.XDG/pcsx2.sock` | Path to PCSX2's PINE IPC socket. Auto-discovered if not present at this path. |
-| `PINE_TIMEOUT` | `5.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
-| `PINE_WAIT` | `3.0` | Time (seconds) to wait after sending a PINE save command before killing PCSX2, giving the write time to complete. |
+| `PINE_TIMEOUT` | `2.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
+| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the PINE command. Polling stops early once the write is detected. Increase for slow disks or large games. |
 | `SAVE_SLOT` | `0` | Default save state slot (0–9) for `/save-and-exit` when no `slot` is specified. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
 

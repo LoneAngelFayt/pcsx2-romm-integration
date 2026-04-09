@@ -37,8 +37,8 @@ INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
 # PCSX2 2.x creates the PINE socket as pcsx2.sock (not pcsx2-{slot})
 PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
-PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "2.0"))   # connect + send; PCSX2 2.x never responds
-PINE_WAIT    = float(os.environ.get("PINE_WAIT",    "3.0"))   # post-send settle before kill
+PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "2.0"))   # connect + send timeout
+PINE_WAIT    = float(os.environ.get("PINE_WAIT",   "20.0"))   # max seconds to poll for write completion
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
@@ -252,17 +252,6 @@ def _launch_pcsx2(rom_path):
     _launch_pcsx2_internal(rom_path)
 
 
-def _recv_exact(s: _socket.socket, n: int) -> bytes:
-    """Read exactly n bytes from a socket, accumulating across partial reads."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = s.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError(f"PINE: socket closed after {len(buf)}/{n} bytes")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
 def _find_pine_socket() -> Path | None:
     """Locate PCSX2's PINE Unix socket. Tries the configured path first, then
     falls back to a glob search so the correct name is discovered automatically."""
@@ -358,9 +347,10 @@ def _pine_save_state(slot: int) -> bool:
 
     Confirmed behaviour in PCSX2 2.6.3: the command is received and the save
     state file IS written to SSTATE_DIR, but PCSX2 never sends a socket
-    response for any PINE opcode. We detect write completion by polling
-    SSTATE_DIR rather than sleeping a fixed duration, timing out after
-    PINE_WAIT seconds if no write is detected.
+    response for any PINE opcode. The write can take 10–20 s for large games.
+    We close the socket immediately after sending and poll SSTATE_DIR for up
+    to PINE_WAIT seconds (default 20 s), stopping as soon as the write
+    stabilises.
 
     Returns True if the command was successfully sent.
     """
@@ -378,14 +368,8 @@ def _pine_save_state(slot: int) -> bool:
             s.settimeout(PINE_TIMEOUT)
             s.connect(str(socket_path))
             s.sendall(msg)
-            # PCSX2 2.6.x never responds; catch the timeout silently.
-            try:
-                resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
-                if resp_len > 0:
-                    _recv_exact(s, resp_len)
-                log.debug("PINE: save state slot %d acknowledged", slot)
-            except Exception:
-                log.debug("PINE: no response for slot %d (expected in PCSX2 2.6.x)", slot)
+            # PCSX2 2.6.x never sends a response for any PINE opcode.
+            # Close immediately so polling starts without wasting PINE_TIMEOUT seconds.
     except Exception as exc:
         log.error("PINE save state (slot %d) failed to send: %s", slot, exc)
         return False
