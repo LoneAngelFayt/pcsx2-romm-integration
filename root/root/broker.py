@@ -458,12 +458,19 @@ def _xdotool_save_state(slot: int) -> bool:
     effective_slot = slot if 1 <= slot <= 10 else 1
     with _session_lock:
         tracked = _session["current_slot"]
-    cycles = (effective_slot - tracked) % 10
+    fwd = (effective_slot - tracked) % 10
+    bwd = (tracked - effective_slot) % 10
+    # Pick the shorter path; prefer backward (Shift+F2) on a tie to avoid
+    # cycling through the OSD slot numbers visibly forward.
+    if bwd <= fwd:
+        key, cycles = "shift+F2", bwd
+    else:
+        key, cycles = "F2", fwd
     xdo_cmd = ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] + ["xdotool"]
 
     for _ in range(cycles):
         try:
-            subprocess.run(xdo_cmd + ["key", "--window", wid, "F2"], timeout=5, check=True)
+            subprocess.run(xdo_cmd + ["key", "--window", wid, key], timeout=5, check=True)
         except Exception as exc:
             log.error("xdotool: slot cycle failed: %s", exc)
             return False
