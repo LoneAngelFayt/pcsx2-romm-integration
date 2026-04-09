@@ -368,15 +368,18 @@ def _pine_save_state(slot: int) -> bool:
             s.settimeout(PINE_TIMEOUT)
             s.connect(str(socket_path))
             s.sendall(msg)
-            # PCSX2 2.6.x never sends a response for any PINE opcode.
-            # Close immediately so polling starts without wasting PINE_TIMEOUT seconds.
+            # Keep the socket open while polling — PCSX2 only processes the
+            # command (and writes the save file) while the connection is alive.
+            # It attempts to write a response; closing early causes EPIPE and
+            # aborts the save.
+            log.info("PINE: save command sent (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
+            deadline = time.monotonic() + PINE_WAIT
+            ok = _wait_for_sstate_write(before, deadline)
     except Exception as exc:
         log.error("PINE save state (slot %d) failed to send: %s", slot, exc)
         return False
 
-    log.info("PINE: save command sent (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
-    deadline = time.monotonic() + PINE_WAIT
-    if not _wait_for_sstate_write(before, deadline):
+    if not ok:
         log.warning("PINE: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
     return True
 
