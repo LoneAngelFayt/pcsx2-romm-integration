@@ -153,30 +153,32 @@ Stops the current game and returns PCSX2 to dashboard mode. Runs in background.
 
 ### `POST /save-and-exit`
 
-Saves the current game state via PINE IPC, kills PCSX2, then relaunches the dashboard.
+Saves the current game state via xdotool F-key, kills PCSX2, then relaunches the dashboard.
+
+Save states are written to `SSTATE_DIR` as `{SERIAL} ({CRC}).{slot:02d}.p2s`.
 
 **Request body:**
 ```json
-{ "slot": 0, "wait": true }
+{ "slot": 10, "wait": true }
 ```
 
 | Field | Default | Description |
 |---|---|---|
-| `slot` | `SAVE_SLOT` env var | Save state slot (1–10) |
+| `slot` | `SAVE_SLOT` env var | Save state slot (1–10). `0` is accepted as a legacy value and remapped to `SAVE_SLOT`. |
 | `wait` | `true` | `true` = blocking (responds after save+kill complete); `false` = fire-and-forget (responds immediately, save+kill in background) |
 
 **`wait=true` response:**
 ```json
-{ "status": "ok", "saved": true, "slot": 0 }
+{ "status": "ok", "saved": true, "slot": 10 }
 ```
 
 **`wait=false` response:**
 ```json
-{ "status": "queued", "slot": 0 }
+{ "status": "queued", "slot": 10 }
 ```
 
 - Returns `409` if no game is running or if a save is already in progress
-- Returns `400` if `slot` is not an integer 1–10
+- Returns `400` if `slot` is not an integer 0–10
 
 ---
 
@@ -282,7 +284,7 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 | Feature | Status | Notes |
 |---|---|---|
 | Game launching via RomM | ✅ Done | `POST /launch` |
-| Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key, slot 10 default |
+| Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key to PCSX2 window, slot 10 default |
 | Return to dashboard on exit | ✅ Done | Automatic after any exit path |
 | Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
 | Manual save state (no exit) | 🔜 Planned | `POST /save-state` with slot selection |
@@ -309,9 +311,11 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 - Run: `docker exec pcsx2 ls /tmp/selkies_js*.sock` to verify Selkies socket files exist
 
 **Save state fails**
-- Check logs for the actual PINE socket path: `docker logs pcsx2 | grep PINE`
-- Verify PINE is enabled: `docker exec pcsx2 grep EnablePINE /config/.config/PCSX2/inis/PCSX2.ini`
-- Increase `PINE_WAIT` (default 3s) if save files are incomplete: `PINE_WAIT=6.0`
+- Check broker logs for xdotool output: `docker logs pcsx2 | grep xdotool`
+- Verify the PCSX2 window is found: look for `xdotool: found window` in logs
+- If window not found, confirm `xdotool` is installed: `docker exec pcsx2 which xdotool`
+- Increase `PINE_WAIT` (default 20s) if saves are slow: `PINE_WAIT=30.0`
+- Save files land at `SSTATE_DIR` (`/config/.config/PCSX2/sstates` by default): `docker exec pcsx2 ls /config/.config/PCSX2/sstates`
 
 **PCSX2 crashes immediately after game launch**
 - Check emulog for GPU or BIOS errors
