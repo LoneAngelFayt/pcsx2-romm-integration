@@ -66,7 +66,7 @@ docker compose up -d --force-recreate pcsx2
 | `PINE_SOCKET` | `/config/.XDG/pcsx2.sock` | Path to PCSX2's PINE IPC socket. Auto-discovered if not present at this path. |
 | `PINE_TIMEOUT` | `2.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
 | `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the PINE command. Polling stops early once the write is detected. Increase for slow disks or large games. |
-| `SAVE_SLOT` | `0` | Default save state slot (0–9) for `/save-and-exit` when no `slot` is specified. |
+| `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
 
 ---

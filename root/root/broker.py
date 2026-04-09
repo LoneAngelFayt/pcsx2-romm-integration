@@ -39,7 +39,7 @@ INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
 PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "2.0"))   # connect + send timeout
 PINE_WAIT    = float(os.environ.get("PINE_WAIT",   "20.0"))   # max seconds to poll for write completion
-SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
+SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "10"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
 logging.basicConfig(
@@ -384,9 +384,88 @@ def _pine_save_state(slot: int) -> bool:
     return True
 
 
+def _xdotool_save_state(slot: int) -> bool:
+    """Save emulator state by sending an F-key to the PCSX2 window via xdotool.
+
+    PCSX2 default bindings: F1–F9 save to slots 1–9, F10 saves to slot 10.
+    Slot 0 is not reachable via keyboard shortcut; it maps to F1 (slot 1).
+
+    Must run as abc (X11 auth). xdotool targets the specific window by PID so
+    focus state doesn't matter. The end user's own F-key presses are unaffected.
+    """
+    # Find the actual pcsx2-qt PID (broker tracks the sudo wrapper PID).
+    try:
+        pids = subprocess.check_output(
+            ["pgrep", "-x", "pcsx2-qt"], text=True
+        ).split()
+    except subprocess.CalledProcessError:
+        log.error("xdotool: pcsx2-qt process not found")
+        return False
+
+    # Find the X11 window — try by PID first, then by class name.
+    wid: str | None = None
+    env = {"DISPLAY": ":0", "HOME": "/config", "USER": "abc"}
+    for pid in pids:
+        try:
+            out = subprocess.check_output(
+                ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
+                ["xdotool", "search", "--pid", pid],
+                text=True, timeout=5,
+            )
+            ids = out.strip().split()
+            if ids:
+                wid = ids[-1]  # last window is the main game surface
+                log.debug("xdotool: found window %s for PID %s", wid, pid)
+                break
+        except Exception:
+            pass
+
+    if wid is None:
+        # Fallback: search by class name
+        try:
+            out = subprocess.check_output(
+                ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
+                ["xdotool", "search", "--classname", "pcsx2-qt"],
+                text=True, timeout=5,
+            )
+            ids = out.strip().split()
+            if ids:
+                wid = ids[-1]
+                log.debug("xdotool: found window %s by classname fallback", wid)
+        except Exception:
+            pass
+
+    if wid is None:
+        log.error("xdotool: PCSX2 window not found")
+        return False
+
+    # F1–F9 → slots 1–9; F10 → slot 10; slot 0 → F1
+    key = f"F{slot}" if 1 <= slot <= 9 else ("F10" if slot == 10 else "F1")
+    effective_slot = slot if 1 <= slot <= 10 else 1
+    before = _sstate_snapshot()
+
+    try:
+        subprocess.run(
+            ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
+            ["xdotool", "key", "--window", wid, key],
+            timeout=5, check=True,
+        )
+    except Exception as exc:
+        log.error("xdotool: key send failed: %s", exc)
+        return False
+
+    log.info("xdotool: sent %s to window %s (slot %d) — waiting for write (max %.1fs)",
+             key, wid, effective_slot, PINE_WAIT)
+    deadline = time.monotonic() + PINE_WAIT
+    ok = _wait_for_sstate_write(before, deadline)
+    if not ok:
+        log.warning("xdotool: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
+    return ok
+
+
 def _save_and_exit(slot: int) -> bool:
     """Save emulator state then kill PCSX2. Returns True if save succeeded."""
-    ok = _pine_save_state(slot)
+    ok = _xdotool_save_state(slot)
     _kill_pcsx2()
     return ok
 
