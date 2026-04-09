@@ -60,6 +60,7 @@ _session: dict = {
     "started_at":       None,
     "is_managed":       False,
     "save_in_progress": False,
+    "current_slot":     1,      # tracks PCSX2's active save state slot (resets to 1 on each launch)
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -81,9 +82,10 @@ def _patch_ini():
         return
     try:
         patches = {
-            "EnablePINE":      "EnablePINE = true",
-            "StartFullscreen": "StartFullscreen = true",
-            "ConfirmShutdown": "ConfirmShutdown = false",
+            "EnablePINE":           "EnablePINE = true",
+            "StartFullscreen":      "StartFullscreen = true",
+            "ConfirmShutdown":      "ConfirmShutdown = false",
+            "SaveStateOnShutdown":  "SaveStateOnShutdown = false",
         }
         lines = INI_PATH.read_text().splitlines()
         applied = set()
@@ -164,6 +166,7 @@ def _launch_pcsx2_internal(rom_path):
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
+        _session["current_slot"] = 1  # PCSX2 always starts at slot 1
     log.info("PCSX2 launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
@@ -385,13 +388,14 @@ def _pine_save_state(slot: int) -> bool:
 
 
 def _xdotool_save_state(slot: int) -> bool:
-    """Save emulator state by sending an F-key to the PCSX2 window via xdotool.
+    """Save emulator state by sending keypresses to the PCSX2 window via xdotool.
 
-    PCSX2 default bindings: F1–F9 save to slots 1–9, F10 saves to slot 10.
-    Slot 0 is not reachable via keyboard shortcut; it maps to F1 (slot 1).
+    PCSX2 has no direct "save to slot N" shortcut. F1 saves to the current slot
+    (default slot 1 on launch) and F2 cycles the current slot forward. This
+    function presses F2 (slot-1) times to reach the target slot, then F1 to save.
 
-    Must run as abc (X11 auth). xdotool targets the specific window by PID so
-    focus state doesn't matter. The end user's own F-key presses are unaffected.
+    Must run as abc (X11 auth). xdotool targets the window by PID so focus state
+    doesn't matter. The end user's own F-key presses are unaffected.
     """
     # Find the actual pcsx2-qt PID (broker tracks the sudo wrapper PID).
     try:
@@ -439,23 +443,37 @@ def _xdotool_save_state(slot: int) -> bool:
         log.error("xdotool: PCSX2 window not found")
         return False
 
-    # F1–F9 → slots 1–9; F10 → slot 10; slot 0 → F1
-    key = f"F{slot}" if 1 <= slot <= 9 else ("F10" if slot == 10 else "F1")
+    # Use tracked current_slot to calculate how many F2 presses are needed.
+    # current_slot is reset to 1 on each PCSX2 launch; the broker tracks its
+    # own F2 sends. User's manual F2 presses during play are not tracked —
+    # this is best-effort slot targeting.
     effective_slot = slot if 1 <= slot <= 10 else 1
+    with _session_lock:
+        tracked = _session["current_slot"]
+    cycles = (effective_slot - tracked) % 10
+    xdo_cmd = ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] + ["xdotool"]
+
+    for _ in range(cycles):
+        try:
+            subprocess.run(xdo_cmd + ["key", "--window", wid, "F2"], timeout=5, check=True)
+        except Exception as exc:
+            log.error("xdotool: slot cycle failed: %s", exc)
+            return False
+        time.sleep(0.05)
+
+    with _session_lock:
+        _session["current_slot"] = effective_slot
+
     before = _sstate_snapshot()
 
     try:
-        subprocess.run(
-            ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
-            ["xdotool", "key", "--window", wid, key],
-            timeout=5, check=True,
-        )
+        subprocess.run(xdo_cmd + ["key", "--window", wid, "F1"], timeout=5, check=True)
     except Exception as exc:
-        log.error("xdotool: key send failed: %s", exc)
+        log.error("xdotool: save key failed: %s", exc)
         return False
 
-    log.info("xdotool: sent %s to window %s (slot %d) — waiting for write (max %.1fs)",
-             key, wid, effective_slot, PINE_WAIT)
+    log.info("xdotool: sent F2×%d then F1 to window %s (slot %d) — waiting for write (max %.1fs)",
+             cycles, wid, effective_slot, PINE_WAIT)
     deadline = time.monotonic() + PINE_WAIT
     ok = _wait_for_sstate_write(before, deadline)
     if not ok:
@@ -479,6 +497,38 @@ def _cleanup_sockets():
         log.info("Socket cleanup: selkies stopped, s6 will restart it shortly.")
     else:
         log.warning("Socket cleanup: selkies not found or already stopped.")
+
+
+_PACTL_ENV = {**os.environ, "PULSE_RUNTIME_PATH": "/defaults"}
+
+
+def _pactl_get_volume() -> int | None:
+    """Return current sink volume as an integer 0–100, or None on error."""
+    result = subprocess.run(
+        ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+        capture_output=True, text=True, env=_PACTL_ENV,
+    )
+    if result.returncode != 0:
+        return None
+    # Output: "Volume: front-left: 65536 / 100% / 0.00 dB, ..."
+    for part in result.stdout.split():
+        if part.endswith("%"):
+            try:
+                return int(part.rstrip("%"))
+            except ValueError:
+                pass
+    return None
+
+
+def _pactl_get_mute() -> bool | None:
+    """Return current mute state as bool, or None on error."""
+    result = subprocess.run(
+        ["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
+        capture_output=True, text=True, env=_PACTL_ENV,
+    )
+    if result.returncode != 0:
+        return None
+    return "yes" in result.stdout.lower()
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -554,10 +604,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", SAVE_SLOT)
-            if not isinstance(slot, int) or not (0 <= slot <= 9):
+            if not isinstance(slot, int) or not (1 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 0–9"})
+                self._send_json(400, {"error": "slot must be 1–10"})
                 return
             wait = body.get("wait", True)
             if wait:
@@ -586,6 +636,41 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # Session state is not yet cleared when this response is sent;
                 # callers polling /status immediately may observe stale state.
                 self._send_json(200, {"status": "queued", "slot": slot})
+            return
+
+        if self.path == "/volume":
+            body = self._read_body()
+            level = body.get("level")
+            if not isinstance(level, int) or not (0 <= level <= 100):
+                self._send_json(400, {"error": "level must be an integer 0–100"})
+                return
+            result = subprocess.run(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"],
+                capture_output=True, env=_PACTL_ENV,
+            )
+            if result.returncode != 0:
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.decode().strip()})
+                return
+            log.info("Volume set to %d%%", level)
+            self._send_json(200, {"status": "ok", "level": level})
+            return
+
+        if self.path == "/mute":
+            body = self._read_body()
+            if "mute" in body:
+                mute_arg = "1" if body["mute"] else "0"
+            else:
+                mute_arg = "toggle"
+            result = subprocess.run(
+                ["pactl", "set-sink-mute", "@DEFAULT_SINK@", mute_arg],
+                capture_output=True, env=_PACTL_ENV,
+            )
+            if result.returncode != 0:
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.decode().strip()})
+                return
+            mute_state = _pactl_get_mute()
+            log.info("Mute %s", "on" if mute_state else "off")
+            self._send_json(200, {"status": "ok", "mute": mute_state})
             return
 
         if self.path != "/launch":

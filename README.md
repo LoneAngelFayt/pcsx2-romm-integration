@@ -162,7 +162,7 @@ Saves the current game state via PINE IPC, kills PCSX2, then relaunches the dash
 
 | Field | Default | Description |
 |---|---|---|
-| `slot` | `SAVE_SLOT` env var | Save state slot (0–9) |
+| `slot` | `SAVE_SLOT` env var | Save state slot (1–10) |
 | `wait` | `true` | `true` = blocking (responds after save+kill complete); `false` = fire-and-forget (responds immediately, save+kill in background) |
 
 **`wait=true` response:**
@@ -176,7 +176,43 @@ Saves the current game state via PINE IPC, kills PCSX2, then relaunches the dash
 ```
 
 - Returns `409` if no game is running or if a save is already in progress
-- Returns `400` if `slot` is not an integer 0–9
+- Returns `400` if `slot` is not an integer 1–10
+
+---
+
+### `POST /volume`
+
+Sets the audio output volume.
+
+```json
+{ "level": 75 }
+```
+
+- `level` must be an integer 0–100
+- Returns `400` if `level` is out of range
+- Returns `500` if `pactl` fails (PulseAudio not ready)
+
+```json
+{ "status": "ok", "level": 75 }
+```
+
+---
+
+### `POST /mute`
+
+Sets or toggles the mute state.
+
+```json
+{ "mute": true }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `mute` | *(omit to toggle)* | `true` = mute, `false` = unmute, omit = toggle |
+
+```json
+{ "status": "ok", "mute": true }
+```
 
 ---
 
@@ -246,11 +282,11 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 | Feature | Status | Notes |
 |---|---|---|
 | Game launching via RomM | ✅ Done | `POST /launch` |
-| Save state on exit (PINE IPC) | ✅ Done | `POST /save-and-exit` |
+| Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key, slot 10 default |
 | Return to dashboard on exit | ✅ Done | Automatic after any exit path |
+| Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
 | Manual save state (no exit) | 🔜 Planned | `POST /save-state` with slot selection |
 | Manual load state | 🔜 Planned | `POST /load-state` with slot selection |
-| Volume control | 🔜 Planned | Via `pactl` or PINE; wire to RomM volume slider |
 | RomM save state export/import | 🔜 Planned | Sync `.p2s` files from `SSTATE_DIR` to/from RomM library |
 
 ---
