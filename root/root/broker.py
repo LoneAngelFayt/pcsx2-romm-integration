@@ -283,6 +283,70 @@ def _find_pine_socket() -> Path | None:
     return None
 
 
+def _sstate_snapshot() -> dict:
+    """Return {Path: (size, mtime)} for every .p2s file currently in SSTATE_DIR."""
+    if not SSTATE_DIR.is_dir():
+        return {}
+    snap = {}
+    for p in SSTATE_DIR.glob("*.p2s"):
+        try:
+            st = p.stat()
+            snap[p] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+    return snap
+
+
+def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
+    """Poll SSTATE_DIR until a save state write completes or deadline is reached.
+
+    Detects both new files and overwrites of existing ones (by mtime change).
+    Once a target file is found, waits for its size to be stable for 0.5 s
+    before returning — handles both direct writes and atomic rename patterns.
+
+    Returns True if a completed write was detected, False if deadline elapsed.
+    """
+    STABLE_SECS  = 0.5
+    POLL_SECS    = 0.1
+    start        = time.monotonic()
+    target: Path | None = None
+    last_size: int | None = None
+    stable_since: float | None = None
+
+    while time.monotonic() < deadline:
+        time.sleep(POLL_SECS)
+        after = _sstate_snapshot()
+
+        if target is None:
+            for p, (size, mtime) in after.items():
+                prev = before.get(p)
+                if prev is None or prev[1] != mtime:
+                    target = p
+                    last_size = size
+                    stable_since = time.monotonic()
+                    log.debug("PINE: write detected — %s (%d bytes)", p.name, size)
+                    break
+        else:
+            cur = after.get(target)
+            if cur is None:
+                # File disappeared mid-write (shouldn't happen, but reset)
+                target = None
+                continue
+            cur_size = cur[0]
+            if cur_size != last_size:
+                last_size = cur_size
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
+                log.info(
+                    "PINE: save state write complete — %s (%d bytes) in %.1fs",
+                    target.name, last_size,
+                    time.monotonic() - start,
+                )
+                return True
+
+    return False
+
+
 def _pine_save_state(slot: int) -> bool:
     """Send MsgSaveState (opcode 9) to PCSX2 via the PINE Unix socket.
 
@@ -290,15 +354,18 @@ def _pine_save_state(slot: int) -> bool:
 
     Confirmed behaviour in PCSX2 2.6.3: the command is received and the save
     state file IS written to SSTATE_DIR, but PCSX2 never sends a socket
-    response for any PINE opcode. We wait up to PINE_TIMEOUT for a response
-    (in case a future build adds one), then fall through to PINE_WAIT to give
-    the disk write time to complete before the caller kills the process.
+    response for any PINE opcode. We detect write completion by polling
+    SSTATE_DIR rather than sleeping a fixed duration, timing out after
+    PINE_WAIT seconds if no write is detected.
 
     Returns True if the command was successfully sent.
     """
     socket_path = _find_pine_socket()
     if socket_path is None:
         return False
+
+    before = _sstate_snapshot()
+
     # MsgSaveState opcode = 9 per PCSX2 PINE IPC spec (pcsx2/PINE.cpp)
     payload = bytes([9, slot & 0xFF])
     msg = struct.pack("<I", len(payload)) + payload
@@ -307,21 +374,22 @@ def _pine_save_state(slot: int) -> bool:
             s.settimeout(PINE_TIMEOUT)
             s.connect(str(socket_path))
             s.sendall(msg)
-            # Read response if PCSX2 sends one; handle gracefully if it doesn't.
+            # PCSX2 2.6.x never responds; catch the timeout silently.
             try:
                 resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
                 if resp_len > 0:
                     _recv_exact(s, resp_len)
                 log.debug("PINE: save state slot %d acknowledged", slot)
             except Exception:
-                log.debug("PINE: no response for slot %d after SHUT_WR", slot)
+                log.debug("PINE: no response for slot %d (expected in PCSX2 2.6.x)", slot)
     except Exception as exc:
         log.error("PINE save state (slot %d) failed to send: %s", slot, exc)
         return False
 
-    # Give PCSX2 time to finish writing the save file before the caller kills it.
-    log.info("PINE: save command sent (slot %d) — waiting %.1fs for write", slot, PINE_WAIT)
-    time.sleep(PINE_WAIT)
+    log.info("PINE: save command sent (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
+    deadline = time.monotonic() + PINE_WAIT
+    if not _wait_for_sstate_write(before, deadline):
+        log.warning("PINE: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
     return True
 
 
