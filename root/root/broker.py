@@ -104,8 +104,10 @@ def _patch_ini():
             if key not in applied:
                 log.warning("PCSX2.ini: %s not found — appending without section header", key)
                 new_lines.append(val)
-        INI_PATH.write_text("\n".join(new_lines) + "\n")
-        log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown)")
+        tmp = INI_PATH.with_suffix(".tmp")
+        tmp.write_text("\n".join(new_lines) + "\n")
+        tmp.replace(INI_PATH)  # atomic on POSIX; prevents partial-write corruption
+        log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown, SaveStateOnShutdown)")
     except Exception as exc:
         log.error("Failed to patch PCSX2.ini: %s", exc)
 
@@ -308,7 +310,6 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
     stable_since: float | None = None
 
     while time.monotonic() < deadline:
-        time.sleep(POLL_SECS)
         after = _sstate_snapshot()
 
         if target is None:
@@ -327,18 +328,20 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
             if cur is None:
                 # File disappeared mid-write (shouldn't happen, but reset)
                 target = None
-                continue
-            cur_size = cur[0]
-            if cur_size != last_size:
-                last_size = cur_size
-                stable_since = time.monotonic()
-            elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
-                log.info(
-                    "PINE: save state write complete — %s (%d bytes) in %.1fs",
-                    target.name, last_size,
-                    time.monotonic() - start,
-                )
-                return True
+            else:
+                cur_size = cur[0]
+                if cur_size != last_size:
+                    last_size = cur_size
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
+                    log.info(
+                        "PINE: save state write complete — %s (%d bytes) in %.1fs",
+                        target.name, last_size,
+                        time.monotonic() - start,
+                    )
+                    return True
+
+        time.sleep(POLL_SECS)
 
     return False
 
@@ -408,7 +411,12 @@ def _xdotool_save_state(slot: int) -> bool:
 
     # Find the X11 window — try by PID first, then by class name.
     wid: str | None = None
-    env = {"DISPLAY": ":0", "HOME": "/config", "USER": "abc"}
+    env = {
+        "DISPLAY":         ":0",
+        "HOME":            "/config",
+        "USER":            "abc",
+        "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
+    }
     for pid in pids:
         try:
             out = subprocess.check_output(
@@ -421,8 +429,8 @@ def _xdotool_save_state(slot: int) -> bool:
                 wid = ids[-1]  # last window is the main game surface
                 log.debug("xdotool: found window %s for PID %s", wid, pid)
                 break
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("xdotool: window search failed for PID %s: %s", pid, exc)
 
     if wid is None:
         # Fallback: search by class name
@@ -436,8 +444,8 @@ def _xdotool_save_state(slot: int) -> bool:
             if ids:
                 wid = ids[-1]
                 log.debug("xdotool: found window %s by classname fallback", wid)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("xdotool: classname search failed: %s", exc)
 
     if wid is None:
         log.error("xdotool: PCSX2 window not found")
@@ -461,9 +469,6 @@ def _xdotool_save_state(slot: int) -> bool:
             return False
         time.sleep(0.05)
 
-    with _session_lock:
-        _session["current_slot"] = effective_slot
-
     before = _sstate_snapshot()
 
     try:
@@ -471,6 +476,10 @@ def _xdotool_save_state(slot: int) -> bool:
     except Exception as exc:
         log.error("xdotool: save key failed: %s", exc)
         return False
+
+    # Update slot tracking only after F1 is confirmed sent.
+    with _session_lock:
+        _session["current_slot"] = effective_slot
 
     log.info("xdotool: sent F2×%d then F1 to window %s (slot %d) — waiting for write (max %.1fs)",
              cycles, wid, effective_slot, PINE_WAIT)
@@ -556,7 +565,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+        except ValueError:
+            length = 0
         if length == 0:
             return {}
         try:
