@@ -390,6 +390,97 @@ def _pine_save_state(slot: int) -> bool:
     return True
 
 
+_XDOTOOL_ENV = {
+    "DISPLAY":         ":0",
+    "HOME":            "/config",
+    "USER":            "abc",
+    "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
+}
+
+
+def _xdotool_find_window() -> str | None:
+    """Return the X11 window ID for pcsx2-qt, or None if not found."""
+    try:
+        pids = subprocess.check_output(
+            ["pgrep", "-x", "pcsx2-qt"], text=True
+        ).split()
+    except subprocess.CalledProcessError:
+        log.error("xdotool: pcsx2-qt process not found")
+        return None
+
+    xdo_base = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+
+    for pid in pids:
+        try:
+            out = subprocess.check_output(
+                xdo_base + ["search", "--pid", pid], text=True, timeout=5,
+            )
+            ids = out.strip().split()
+            if ids:
+                wid = ids[-1]  # last window is the main game surface
+                log.debug("xdotool: found window %s for PID %s", wid, pid)
+                return wid
+        except Exception as exc:
+            log.debug("xdotool: window search failed for PID %s: %s", pid, exc)
+
+    # Fallback: search by class name
+    try:
+        out = subprocess.check_output(
+            xdo_base + ["search", "--classname", "pcsx2-qt"], text=True, timeout=5,
+        )
+        ids = out.strip().split()
+        if ids:
+            wid = ids[-1]
+            log.debug("xdotool: found window %s by classname fallback", wid)
+            return wid
+    except Exception as exc:
+        log.debug("xdotool: classname search failed: %s", exc)
+
+    log.error("xdotool: PCSX2 window not found")
+    return None
+
+
+def _xdotool_cycle_to_slot(wid: str, slot: int) -> bool:
+    """Cycle PCSX2's active save slot to `slot` using F2 / Shift+F2.
+
+    Updates _session["current_slot"] after confirmed key delivery.
+    Returns False if any keypress fails.
+    """
+    effective_slot = slot if 1 <= slot <= 10 else 1
+    with _session_lock:
+        tracked = _session["current_slot"]
+    fwd = (effective_slot - tracked) % 10
+    bwd = (tracked - effective_slot) % 10
+    # Prefer backward (Shift+F2) on a tie to minimise visible OSD cycling.
+    if bwd <= fwd:
+        key, cycles = "shift+F2", bwd
+    else:
+        key, cycles = "F2", fwd
+
+    xdo_cmd = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    for _ in range(cycles):
+        try:
+            subprocess.run(
+                xdo_cmd + ["key", "--window", wid, key], timeout=5, check=True
+            )
+        except Exception as exc:
+            log.error("xdotool: slot cycle failed: %s", exc)
+            return False
+        time.sleep(0.05)
+
+    with _session_lock:
+        _session["current_slot"] = effective_slot
+    return True
+
+
 def _xdotool_save_state(slot: int) -> bool:
     """Save emulator state by sending keypresses to the PCSX2 window via xdotool.
 
@@ -400,101 +491,59 @@ def _xdotool_save_state(slot: int) -> bool:
     Must run as abc (X11 auth). xdotool targets the window by PID so focus state
     doesn't matter. The end user's own F-key presses are unaffected.
     """
-    # Find the actual pcsx2-qt PID (broker tracks the sudo wrapper PID).
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", "pcsx2-qt"], text=True
-        ).split()
-    except subprocess.CalledProcessError:
-        log.error("xdotool: pcsx2-qt process not found")
+    wid = _xdotool_find_window()
+    if wid is None:
         return False
 
-    # Find the X11 window — try by PID first, then by class name.
-    wid: str | None = None
-    env = {
-        "DISPLAY":         ":0",
-        "HOME":            "/config",
-        "USER":            "abc",
-        "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
-    }
-    for pid in pids:
-        try:
-            out = subprocess.check_output(
-                ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
-                ["xdotool", "search", "--pid", pid],
-                text=True, timeout=5,
-            )
-            ids = out.strip().split()
-            if ids:
-                wid = ids[-1]  # last window is the main game surface
-                log.debug("xdotool: found window %s for PID %s", wid, pid)
-                break
-        except Exception as exc:
-            log.debug("xdotool: window search failed for PID %s: %s", pid, exc)
-
-    if wid is None:
-        # Fallback: search by class name
-        try:
-            out = subprocess.check_output(
-                ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] +
-                ["xdotool", "search", "--classname", "pcsx2-qt"],
-                text=True, timeout=5,
-            )
-            ids = out.strip().split()
-            if ids:
-                wid = ids[-1]
-                log.debug("xdotool: found window %s by classname fallback", wid)
-        except Exception as exc:
-            log.debug("xdotool: classname search failed: %s", exc)
-
-    if wid is None:
-        log.error("xdotool: PCSX2 window not found")
+    if not _xdotool_cycle_to_slot(wid, slot):
         return False
-
-    # Use tracked current_slot to calculate how many F2 presses are needed.
-    # current_slot is reset to 1 on each PCSX2 launch; the broker tracks its
-    # own F2 sends. User's manual F2 presses during play are not tracked —
-    # this is best-effort slot targeting.
-    effective_slot = slot if 1 <= slot <= 10 else 1
-    with _session_lock:
-        tracked = _session["current_slot"]
-    fwd = (effective_slot - tracked) % 10
-    bwd = (tracked - effective_slot) % 10
-    # Pick the shorter path; prefer backward (Shift+F2) on a tie to avoid
-    # cycling through the OSD slot numbers visibly forward.
-    if bwd <= fwd:
-        key, cycles = "shift+F2", bwd
-    else:
-        key, cycles = "F2", fwd
-    xdo_cmd = ["sudo", "-u", "abc", "env"] + [f"{k}={v}" for k, v in env.items()] + ["xdotool"]
-
-    for _ in range(cycles):
-        try:
-            subprocess.run(xdo_cmd + ["key", "--window", wid, key], timeout=5, check=True)
-        except Exception as exc:
-            log.error("xdotool: slot cycle failed: %s", exc)
-            return False
-        time.sleep(0.05)
 
     before = _sstate_snapshot()
 
+    xdo_cmd = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
     try:
         subprocess.run(xdo_cmd + ["key", "--window", wid, "F1"], timeout=5, check=True)
     except Exception as exc:
         log.error("xdotool: save key failed: %s", exc)
         return False
 
-    # Update slot tracking only after F1 is confirmed sent.
-    with _session_lock:
-        _session["current_slot"] = effective_slot
-
-    log.info("xdotool: sent F2×%d then F1 to window %s (slot %d) — waiting for write (max %.1fs)",
-             cycles, wid, effective_slot, PINE_WAIT)
+    log.info(
+        "xdotool: F1 sent to window %s (slot %d) — waiting for write (max %.1fs)",
+        wid, slot, PINE_WAIT,
+    )
     deadline = time.monotonic() + PINE_WAIT
     ok = _wait_for_sstate_write(before, deadline)
     if not ok:
         log.warning("xdotool: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
     return ok
+
+
+def _xdotool_load_state(slot: int) -> bool:
+    """Load emulator state by cycling to slot and pressing F3."""
+    wid = _xdotool_find_window()
+    if wid is None:
+        return False
+
+    if not _xdotool_cycle_to_slot(wid, slot):
+        return False
+
+    xdo_cmd = (
+        ["sudo", "-u", "abc", "env"]
+        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
+        + ["xdotool"]
+    )
+    try:
+        subprocess.run(xdo_cmd + ["key", "--window", wid, "F3"], timeout=5, check=True)
+    except Exception as exc:
+        log.error("xdotool: load key failed: %s", exc)
+        return False
+
+    log.info("xdotool: F3 sent to window %s (slot %d)", wid, slot)
+    return True
 
 
 def _save_and_exit(slot: int) -> bool:
@@ -694,6 +743,48 @@ class BrokerHandler(BaseHTTPRequestHandler):
             mute_state = _pactl_get_mute()
             log.info("Mute %s", "on" if mute_state else "off")
             self._send_json(200, {"status": "ok", "mute": mute_state})
+            return
+
+        if self.path == "/save-state":
+            with _session_lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
+                _session["save_in_progress"] = True
+            body = self._read_body()
+            slot = body.get("slot", 1)
+            if not isinstance(slot, int) or not (1 <= slot <= 9):
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                self._send_json(400, {"error": "slot must be 1–9"})
+                return
+            def _bg_save(s):
+                try:
+                    ok = _xdotool_save_state(s)
+                finally:
+                    with _session_lock:
+                        _session["save_in_progress"] = False
+                if not ok:
+                    log.warning("save-state: write not confirmed for slot %d", s)
+            Thread(target=_bg_save, args=(slot,), daemon=True).start()
+            self._send_json(200, {"status": "saving", "slot": slot})
+            return
+
+        if self.path == "/load-state":
+            with _session_lock:
+                if _session["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+            body = self._read_body()
+            slot = body.get("slot", 1)
+            if not isinstance(slot, int) or not (1 <= slot <= 9):
+                self._send_json(400, {"error": "slot must be 1–9"})
+                return
+            ok = _xdotool_load_state(slot)
+            self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", "loaded": ok, "slot": slot})
             return
 
         if self.path != "/launch":
