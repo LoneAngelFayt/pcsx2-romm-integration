@@ -515,15 +515,25 @@ def _cleanup_sockets():
         log.warning("Socket cleanup: selkies not found or already stopped.")
 
 
-_PACTL_ENV = {**os.environ, "PULSE_RUNTIME_PATH": "/defaults"}
+_PACTL_CMD = [
+    "sudo", "-u", "abc", "env",
+    "PULSE_RUNTIME_PATH=/defaults",
+    "HOME=/config",
+    "USER=abc",
+]
+
+
+def _pactl(*args: str) -> subprocess.CompletedProcess:
+    """Run pactl as abc so it connects to abc's PulseAudio instance."""
+    return subprocess.run(
+        _PACTL_CMD + ["pactl"] + list(args),
+        capture_output=True, text=True, timeout=5,
+    )
 
 
 def _pactl_get_volume() -> int | None:
     """Return current sink volume as an integer 0–100, or None on error."""
-    result = subprocess.run(
-        ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
-        capture_output=True, text=True, env=_PACTL_ENV,
-    )
+    result = _pactl("get-sink-volume", "@DEFAULT_SINK@")
     if result.returncode != 0:
         return None
     # Output: "Volume: front-left: 65536 / 100% / 0.00 dB, ..."
@@ -538,13 +548,10 @@ def _pactl_get_volume() -> int | None:
 
 def _pactl_get_mute() -> bool | None:
     """Return current mute state as bool, or None on error."""
-    result = subprocess.run(
-        ["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
-        capture_output=True, text=True, env=_PACTL_ENV,
-    )
+    result = _pactl("get-sink-mute", "@DEFAULT_SINK@")
     if result.returncode != 0:
         return None
-    return "yes" in result.stdout.lower()
+    return result.stdout.strip().endswith("yes")
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -666,12 +673,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(level, int) or not (0 <= level <= 100):
                 self._send_json(400, {"error": "level must be an integer 0–100"})
                 return
-            result = subprocess.run(
-                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{level}%"],
-                capture_output=True, env=_PACTL_ENV,
-            )
+            result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
-                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.decode().strip()})
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
                 return
             log.info("Volume set to %d%%", level)
             self._send_json(200, {"status": "ok", "level": level})
@@ -683,12 +687,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 mute_arg = "1" if body["mute"] else "0"
             else:
                 mute_arg = "toggle"
-            result = subprocess.run(
-                ["pactl", "set-sink-mute", "@DEFAULT_SINK@", mute_arg],
-                capture_output=True, env=_PACTL_ENV,
-            )
+            result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
             if result.returncode != 0:
-                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.decode().strip()})
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
                 return
             mute_state = _pactl_get_mute()
             log.info("Mute %s", "on" if mute_state else "off")
