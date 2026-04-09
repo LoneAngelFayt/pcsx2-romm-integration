@@ -37,10 +37,10 @@ INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
 # PCSX2 2.x creates the PINE socket as pcsx2.sock (not pcsx2-{slot})
 PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
-PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "5.0"))   # connect + send only
+PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "2.0"))   # connect + send; PCSX2 2.x never responds
 PINE_WAIT    = float(os.environ.get("PINE_WAIT",    "3.0"))   # post-send settle before kill
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
-SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.local/share/PCSX2/sstates"))
+SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -288,10 +288,11 @@ def _pine_save_state(slot: int) -> bool:
 
     Wire format: [uint32 LE: payload length] [0x09] [slot byte]
 
-    PCSX2 2.x processes the save asynchronously and closes the socket without
-    sending a response, so we do not block waiting for one. After the command
-    is sent we sleep PINE_WAIT seconds to let the disk write complete before
-    the caller kills the process.
+    Confirmed behaviour in PCSX2 2.6.3: the command is received and the save
+    state file IS written to SSTATE_DIR, but PCSX2 never sends a socket
+    response for any PINE opcode. We wait up to PINE_TIMEOUT for a response
+    (in case a future build adds one), then fall through to PINE_WAIT to give
+    the disk write time to complete before the caller kills the process.
 
     Returns True if the command was successfully sent.
     """
