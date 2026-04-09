@@ -40,7 +40,7 @@ PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"
 PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "5.0"))   # connect + send only
 PINE_WAIT    = float(os.environ.get("PINE_WAIT",    "3.0"))   # post-send settle before kill
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "0"))
-SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
+SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.local/share/PCSX2/sstates"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -306,9 +306,6 @@ def _pine_save_state(slot: int) -> bool:
             s.settimeout(PINE_TIMEOUT)
             s.connect(str(socket_path))
             s.sendall(msg)
-            # Signal end-of-batch so PCSX2 stops reading and processes the command.
-            # Without SHUT_WR, the PINE server waits for more data indefinitely.
-            s.shutdown(_socket.SHUT_WR)
             # Read response if PCSX2 sends one; handle gracefully if it doesn't.
             try:
                 resp_len = struct.unpack("<I", _recv_exact(s, 4))[0]
