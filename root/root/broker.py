@@ -417,7 +417,7 @@ def _xdotool_find_window() -> str | None:
     for pid in pids:
         try:
             out = subprocess.check_output(
-                xdo_base + ["search", "--pid", pid], text=True, timeout=5,
+                xdo_base + ["search", "--onlyvisible", "--pid", pid], text=True, timeout=5,
             )
             ids = out.strip().split()
             if ids:
@@ -430,7 +430,7 @@ def _xdotool_find_window() -> str | None:
     # Fallback: search by class name
     try:
         out = subprocess.check_output(
-            xdo_base + ["search", "--classname", "pcsx2-qt"], text=True, timeout=5,
+            xdo_base + ["search", "--onlyvisible", "--classname", "pcsx2-qt"], text=True, timeout=5,
         )
         ids = out.strip().split()
         if ids:
@@ -466,6 +466,9 @@ def _xdotool_cycle_to_slot(wid: str, slot: int) -> bool:
         + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
         + ["xdotool"]
     )
+    # Track slot position incrementally so a partial failure leaves
+    # current_slot reflecting how far we actually got.
+    current = tracked
     for _ in range(cycles):
         try:
             subprocess.run(
@@ -473,7 +476,14 @@ def _xdotool_cycle_to_slot(wid: str, slot: int) -> bool:
             )
         except Exception as exc:
             log.error("xdotool: slot cycle failed: %s", exc)
+            with _session_lock:
+                _session["current_slot"] = current
             return False
+        # Advance current by one step in the chosen direction (1-based, wraps 1..10).
+        if key == "F2":
+            current = current % 10 + 1       # forward: 10 → 1, n → n+1
+        else:
+            current = (current - 2) % 10 + 1  # backward: 1 → 10, n → n-1
         time.sleep(0.05)
 
     with _session_lock:
@@ -516,10 +526,9 @@ def _xdotool_save_state(slot: int) -> bool:
         wid, slot, PINE_WAIT,
     )
     deadline = time.monotonic() + PINE_WAIT
-    ok = _wait_for_sstate_write(before, deadline)
-    if not ok:
-        log.warning("xdotool: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
-    return ok
+    if not _wait_for_sstate_write(before, deadline):
+        log.warning("xdotool: save state write not confirmed within %.1fs (F1 was sent)", PINE_WAIT)
+    return True  # F1 was delivered; write detection is best-effort confirmation
 
 
 def _xdotool_load_state(slot: int) -> bool:
