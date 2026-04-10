@@ -1,128 +1,34 @@
-# pcsx2-broker-mod
+# pcsx2-romm-integration
 
-A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that installs and runs `broker.py` inside the [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) container for RomM integration.
+A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that integrates [PCSX2](https://pcsx2.net/) with [RomM](https://github.com/rommapp/romm) — launching PS2 games on demand from RomM's web UI and streaming the output back via Selkies.
 
 ---
 
 ## What It Does
 
-On every container start, this mod:
+This mod installs a small HTTP broker inside the [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) container that:
 
-1. Checks for Python 3 and installs it if missing
-2. Copies `broker.py` to `/root/broker.py` and makes it executable
-3. Starts `broker.py` as a managed background service via s6-overlay
-4. Automatically restarts `broker.py` if it crashes
+1. Exposes an API on port 8000 so RomM can request game launches
+2. Manages the PCSX2 process lifecycle (start, stop, game switching, dashboard mode)
+3. Saves game state via PCSX2's PINE IPC before exit
+4. Patches Selkies and PCSX2 at init time for reliable controller and socket handling
+5. Supervises itself via s6-overlay (auto-restarts on crash)
 
 ---
 
 ## Requirements
 
-- A running [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) container
-- Docker Compose (or equivalent)
-- Internet access from the container (for Python install if not present)
+- **Base image:** [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) (Wayland/Selkies already included)
+- **RomM instance** with streaming configured (see [RomM Configuration](#romm-configuration))
+- **Shared ROM volume** mounted at the same path in both containers
+- **Network access** from RomM's backend to the broker at `pcsx2:8000`
 
 ---
 
 ## Installation
 
-Add the `DOCKER_MODS` environment variable to your PCSX2 container:
-```yaml
-    - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
-```
+Add `DOCKER_MODS` to your PCSX2 container in `docker-compose.yml`:
 
-Then recreate the container:
-```bash
-docker compose up -d --force-recreate
-```
-
-That's it. The mod will be pulled and applied automatically on every container start.
-
----
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `BROKER_SECRET` | Recommended | *(none)* | Shared secret for authenticating launch requests. Sent as the `X-Broker-Secret` header. If unset, the broker accepts unauthenticated requests from anyone with network access. |
-| `BROKER_PORT` | No | `8000` | Port the broker HTTP server listens on. Only set this if `8000` conflicts with another service. |
-| `DISPLAY` | No | Auto-detected | X display to launch PCSX2 on. Auto-detected from `/tmp/.X11-unix/` — only override if auto-detection fails. |
-
-### Recommended `docker-compose.yml`
-```yaml
-services:
-  pcsx2:
-    image: lscr.io/linuxserver/pcsx2:latest
-    container_name: pcsx2
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Chicago
-      - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
-      - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
-    ports:
-      - 8000:8000   # broker API
-    # ... rest of your config
-```
-
-> **Note:** `BROKER_SECRET` is optional but strongly recommended. Without it, anyone on your network can send launch commands to the broker.
-
----
-
-## API Reference
-
-The broker exposes a small HTTP API on `BROKER_PORT`.
-
-### `GET /health`
-Returns `200 OK` if the broker is running.
-
-### `GET /status`
-Returns the currently active session, or `{"active": false}` if idle.
-```json
-{
-  "active": true,
-  "rom_path": "/data/roms/ps2/game.iso",
-  "rom_name": "game",
-  "started_at": "2024-01-01T00:00:00Z"
-}
-```
-
-### `POST /launch`
-Kills any running game and launches a new ROM.
-
-**Headers:**
-```
-Content-Type: application/json
-X-Broker-Secret: your_secret_here
-```
-
-**Body:**
-```json
-{
-  "rom_path": "/data/roms/ps2/game.iso",
-  "rom_name": "Game Title"
-}
-```
-
-> `rom_path` must be the path **inside the container**. Make sure your ROMs volume is mounted at the same path in both the PCSX2 container and whatever is calling the broker (e.g. RomM).
-
-### `DELETE /launch`
-Stops the current game and returns PCSX2 to the dashboard.
-
-**Headers:**
-```
-X-Broker-Secret: your_secret_here
-```
-
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `BROKER_SECRET` | Recommended | *(none)* | Shared secret for authenticating launch requests. Sent as the `X-Broker-Secret` header. If unset, the broker accepts unauthenticated requests from anyone with network access. |
-| `BROKER_PORT` | No | `8000` | Port the broker HTTP server listens on. Only set this if `8000` conflicts with another service. |
-| `ROM_ROOT` | No | `/romm/library` | Root path inside the container where ROMs are mounted. Launch requests are rejected if `rom_path` is not under this directory. |
-
-### Recommended `docker-compose.yml`
 ```yaml
 services:
   pcsx2:
@@ -133,125 +39,310 @@ services:
       - PGID=1000
       - TZ=America/Chicago
       - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
-      - BROKER_SECRET=your_secret_here   # recommended — leave blank to disable auth
+      - BROKER_SECRET=your_secret_here
+      - ROM_ROOT=/romm/library
     ports:
       - 8000:8000   # broker API
-    # ... rest of your config
+    volumes:
+      - ./config:/config
+      - /mnt/roms:/romm/library   # must match ROM_ROOT; shared with RomM
 ```
 
-> **Note:** `BROKER_SECRET` is optional but strongly recommended. Without it, anyone on your network can send launch commands to the broker.
+Then recreate the container:
+
+```bash
+docker compose up -d --force-recreate pcsx2
+```
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BROKER_SECRET` | *(none)* | Shared secret for authentication. Sent as the `X-Broker-Secret` header. If unset, all requests are accepted — not recommended on a shared network. |
+| `BROKER_PORT` | `8000` | Port the broker HTTP server listens on. |
+| `ROM_ROOT` | `/romm/library` | Root path inside the container where ROMs are mounted. Requests with a `rom_path` outside this directory are rejected. |
+| `PINE_SOCKET` | `/config/.XDG/pcsx2.sock` | Path to PCSX2's PINE IPC socket. Auto-discovered if not present at this path. |
+| `PINE_TIMEOUT` | `2.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
+| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the PINE command. Polling stops early once the write is detected. Increase for slow disks or large games. |
+| `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
+| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
+
+---
+
+## RomM Configuration
+
+Add a `streaming` block to RomM's `config.yml`:
+
+```yaml
+streaming:
+  enabled: true
+  containers:
+    - platform: ps2
+      host: "https://192.168.x.x:3001"        # browser-facing Selkies web UI
+      broker_host: "http://pcsx2:8000"        # server-to-server broker API (optional — derived from host if omitted)
+      label: "PCSX2"
+```
+
+The `platform` value must match the platform slug used for your PS2 ROMs in RomM. The ROM volume must be mounted at the same path in both containers. If RomM sees a ROM at `/romm/library/ps2/game.chd`, the PCSX2 container must also have that file at `/romm/library/ps2/game.chd`.
 
 ---
 
 ## API Reference
 
-The broker exposes a small HTTP API on `BROKER_PORT`.
+All endpoints return JSON. If `BROKER_SECRET` is configured, include `X-Broker-Secret: <secret>` in every request.
+
+---
 
 ### `GET /health`
+
 Returns `200 OK` if the broker is running.
 
+```json
+{ "status": "ok" }
+```
+
+---
+
 ### `GET /status`
-Returns the currently active session, or `{"active": false}` if idle.
+
+Returns the current session.
+
 ```json
 {
   "active": true,
-  "rom_path": "/data/roms/ps2/game.iso",
+  "rom_path": "/romm/library/ps2/game.chd",
   "rom_name": "game",
-  "started_at": "2024-01-01T00:00:00Z"
+  "started_at": "2026-01-01T00:00:00Z"
 }
 ```
+
+Returns `{"active": false, ...}` when no game is running.
+
+---
 
 ### `POST /launch`
-Kills any running game and launches a new ROM.
 
-**Headers:**
-```
-Content-Type: application/json
-X-Broker-Secret: your_secret_here
-```
+Kills any running game and launches a new ROM. Returns immediately; launch runs in a background thread.
 
-**Body:**
 ```json
-{
-  "rom_path": "/data/roms/ps2/game.iso",
-  "rom_name": "Game Title"
-}
+{ "rom_path": "/romm/library/ps2/game.chd", "rom_name": "Game Title" }
 ```
 
-> `rom_path` must be the path **inside the container**. Make sure your ROMs volume is mounted at the same path in both the PCSX2 container and whatever is calling the broker (e.g. RomM).
+- `rom_path` must exist and be under `ROM_ROOT`
+- Returns `409` if a save is in progress
+- Returns `400` if `rom_path` is missing or outside `ROM_ROOT`
+- Returns `422` if `rom_path` does not exist
+
+```json
+{ "status": "launching", "rom_path": "/romm/library/ps2/game.chd" }
+```
+
+---
 
 ### `DELETE /launch`
-Stops the current game and returns PCSX2 to the dashboard.
 
-**Headers:**
-```
-X-Broker-Secret: your_secret_here
-```
+Stops the current game and returns PCSX2 to dashboard mode. Runs in background.
 
-
-## Pinning to a Specific Version
-
-By default `:latest` always pulls the newest release. If you want a stable pin that never changes:
-```yaml
-# Pinned to exact version — never changes
-- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:v1.0.0
-
-# Pinned to minor — gets patches but not breaking changes
-- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:v1.0
-
-# Always latest release
-- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-broker-mod:latest
+```json
+{ "status": "resetting" }
 ```
 
-Available versions can be found on the [Packages page](https://github.com/LoneAngelFayt/pcsx2-broker-mod/pkgs/container/pcsx2-broker-mod).
+---
+
+### `POST /save-and-exit`
+
+Saves the current game state via xdotool F-key, kills PCSX2, then relaunches the dashboard.
+
+Save states are written to `SSTATE_DIR` as `{SERIAL} ({CRC}).{slot:02d}.p2s`.
+
+**Request body:**
+```json
+{ "slot": 10, "wait": true }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `slot` | `SAVE_SLOT` env var | Save state slot (1–10). `0` is accepted as a legacy value and remapped to `SAVE_SLOT`. |
+| `wait` | `true` | `true` = blocking (responds after save+kill complete); `false` = fire-and-forget (responds immediately, save+kill in background) |
+
+**`wait=true` response:**
+```json
+{ "status": "ok", "saved": true, "slot": 10 }
+```
+
+**`wait=false` response:**
+```json
+{ "status": "queued", "slot": 10 }
+```
+
+- Returns `409` if no game is running or if a save is already in progress
+- Returns `400` if `slot` is not an integer 0–10
+
+---
+
+### `POST /volume`
+
+Sets the audio output volume.
+
+```json
+{ "level": 75 }
+```
+
+- `level` must be an integer 0–100
+- Returns `400` if `level` is out of range
+- Returns `500` if `pactl` fails (PulseAudio not ready)
+
+```json
+{ "status": "ok", "level": 75 }
+```
+
+---
+
+### `POST /mute`
+
+Sets or toggles the mute state.
+
+```json
+{ "mute": true }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `mute` | *(omit to toggle)* | `true` = mute, `false` = unmute, omit = toggle |
+
+```json
+{ "status": "ok", "mute": true }
+```
+
+---
+
+### `POST /cleanup`
+
+Restarts the Selkies process to flush stale gamepad socket connections. Selkies is back within a few seconds via s6 supervision.
+
+```json
+{ "status": "cleanup started" }
+```
+
+Use this if controller inputs become unresponsive. Under normal operation the `reader.at_eof()` patch applied at container init prevents connection buildup.
 
 ---
 
 ## Verifying It's Running
 
-Check the container logs for broker mod output:
 ```bash
 docker logs pcsx2 | grep broker
 ```
 
-You should see:
+Expected startup:
 ```
-[broker-mod] Checking for Python3...
-[broker-mod] Python3 already installed: Python 3.x.x
-[broker-mod] Setting broker.py executable...
-[broker-mod] Starting broker.py...
+14:20:15 [broker] INFO Broker starting — waiting 5s for desktop...
+14:20:21 [broker] INFO ROM broker listening on port 8000
+14:20:21 [broker] INFO Shared secret auth enabled
+14:20:23 [broker] INFO Launching PCSX2 (rom=dashboard)
+14:20:24 [broker] INFO PCSX2 launched (PID 42)
+```
+
+Expected on game launch:
+```
+14:22:10 [broker] INFO Stopping PCSX2 (PID 42)...
+14:22:10 [broker] INFO Launching PCSX2 (rom=/romm/library/ps2/game.chd)
+14:22:11 [broker] INFO PCSX2 launched (PID 123)
+```
+
+Expected on save-and-exit:
+```
+14:25:45 [broker] INFO PINE: save command sent (slot 0) — waiting 3.0s for write
+14:25:48 [broker] INFO Stopping PCSX2 (PID 123)...
+14:25:49 [broker] INFO Launching PCSX2 (rom=dashboard)
+14:25:49 [broker] INFO PCSX2 launched (PID 456)
 ```
 
 ---
 
-## Versions
+## Pinning to a Version
 
-This mod follows [Semantic Versioning](https://semver.org/):
+```yaml
+# Exact version — never changes
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:v1.2.0
 
-| Change type | Example commit | Version bump |
+# Minor pin — gets patches only
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:v1.2
+
+# Always latest release
+- DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
+```
+
+Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-integration/pkgs/container/pcsx2-romm-integration-mod)
+
+---
+
+## Roadmap
+
+| Feature | Status | Notes |
 |---|---|---|
-| Bug fix or tweak | `fix: broker reconnect timeout` | `v1.0.0 → v1.0.1` |
-| New feature | `feat: add romm auth header` | `v1.0.1 → v1.1.0` |
-| Breaking change | `feat!: rewrite broker protocol` | `v1.1.0 → v2.0.0` |
-
-Releases are created automatically when changes are merged to `main`. See [Releases](https://github.com/LoneAngelFayt/pcsx2-broker-mod/releases) for the full changelog.
+| Game launching via RomM | ✅ Done | `POST /launch` |
+| Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key to PCSX2 window, slot 10 default |
+| Return to dashboard on exit | ✅ Done | Automatic after any exit path |
+| Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
+| Manual save state (no exit) | 🔜 Planned | `POST /save-state` with slot selection |
+| Manual load state | 🔜 Planned | `POST /load-state` with slot selection |
+| RomM save state export/import | 🔜 Planned | Sync `.p2s` files from `SSTATE_DIR` to/from RomM library |
 
 ---
 
 ## Troubleshooting
 
-**Mod doesn't appear to be applying**
-Make sure `DOCKER_MODS` is set correctly and the image tag exists. Run `docker compose up` (not `-d`) to see full output during startup.
+**Mod doesn't apply or broker doesn't start**
+- Verify the image name: `ghcr.io/loneangelfayt/pcsx2-romm-integration-mod`
+- Run `docker compose up` (no `-d`) to see full startup output
+- Check that the base image is `lscr.io/linuxserver/pcsx2:latest` or compatible
 
-**Python install fails on startup**
-The container needs outbound internet access. Check your network config or firewall rules.
+**Black screen for more than 60 seconds after launch**
+- A 15–30 second black screen is normal (PS2 BIOS boot sequence)
+- If it persists, confirm BIOS files are in place: `docker exec pcsx2 ls /config/bios`
+- Check PCSX2 emulog: `docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`
 
-**broker.py crashes immediately**
-Check logs with `docker logs pcsx2`. The s6 supervisor will attempt to restart it — repeated crashes will show up in the log output.
+**Controllers not working**
+- Try `POST /cleanup` to restart Selkies and flush stale gamepad sockets
+- Confirm `LD_PRELOAD` is set correctly in the broker environment (check broker logs)
+- Run: `docker exec pcsx2 ls /tmp/selkies_js*.sock` to verify Selkies socket files exist
 
+**Save state fails**
+- Check broker logs for xdotool output: `docker logs pcsx2 | grep xdotool`
+- Verify the PCSX2 window is found: look for `xdotool: found window` in logs
+- If window not found, confirm `xdotool` is installed: `docker exec pcsx2 which xdotool`
+- Increase `PINE_WAIT` (default 20s) if saves are slow: `PINE_WAIT=30.0`
+- Save files land at `SSTATE_DIR` (`/config/.config/PCSX2/sstates` by default): `docker exec pcsx2 ls /config/.config/PCSX2/sstates`
+
+**PCSX2 crashes immediately after game launch**
+- Check emulog for GPU or BIOS errors
+- Ensure the game file is not corrupted: `.chd`, `.iso`, `.bin/.cue` are all supported
+
+**RomM doesn't show the PCSX2 play button**
+- Confirm `streaming.enabled: true` in RomM's `config.yml`
+- Confirm the `platform` slug matches the ROM platform in RomM
+- Restart RomM after config changes: `docker compose restart romm`
+- Check the streaming config API: `curl http://romm:5000/api/streaming/config`
+
+---
+
+## Versions
+
+This project follows [Semantic Versioning](https://semver.org/):
+
+| Change type | Example | Bump |
+|---|---|---|
+| Bug fix | `fix: PINE socket discovery` | `1.0.0 → 1.0.1` |
+| New feature | `feat: save-and-exit endpoint` | `1.0.1 → 1.1.0` |
+| Breaking change | `feat!: new broker protocol` | `1.1.0 → 2.0.0` |
+
+Releases are created automatically on merge to `main`. See [Releases](https://github.com/LoneAngelFayt/pcsx2-romm-integration/releases) for the full changelog.
 
 ---
 
 ## License
 
-GPLv3
+[GPLv3](LICENSE)

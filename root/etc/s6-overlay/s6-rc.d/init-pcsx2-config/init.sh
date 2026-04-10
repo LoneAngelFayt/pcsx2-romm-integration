@@ -24,13 +24,28 @@ echo "[broker-mod] Disabled labwc autostart."
 INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
 if [ -f "$INPUT_HANDLER" ]; then
     if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
-        echo "[broker-mod] selkies input_handler.py already patched."
+        echo "[broker-mod] selkies input_handler.py EOF patch already applied."
     else
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
             "$INPUT_HANDLER" \
             || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
         echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+    fi
+
+    # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle
+    # (handler started/finished, config sent, arch specifier, active list changes ×8
+    # sockets). Demote to WARNING to keep errors/warnings while clearing the spam.
+    if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
+        echo "[broker-mod] selkies_gamepad log-level patch already applied."
+    else
+        if sed -i \
+            's/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")\nlogger_selkies_gamepad.setLevel(logging.WARNING)/' \
+            "$INPUT_HANDLER"; then
+            echo "[broker-mod] Patched selkies_gamepad log level to WARNING."
+        else
+            echo "[broker-mod] ERROR: sed patch failed setting selkies_gamepad log level"
+        fi
     fi
 else
     echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
