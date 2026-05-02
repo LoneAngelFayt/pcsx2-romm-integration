@@ -23,14 +23,18 @@ SECRET   = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
 ENV = {
-    "DISPLAY":           ":0",
-    "WAYLAND_DISPLAY":   "wayland-1",
+    "DISPLAY":           os.environ.get("DISPLAY", ":0"),
+    "WAYLAND_DISPLAY":   os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
     "XDG_RUNTIME_DIR":   "/config/.XDG",
     "PULSE_RUNTIME_PATH":"/defaults",
+    # DRI_NODE is needed for hardware acceleration.
+    "DRI_NODE":          os.environ.get("DRI_NODE", ""),
+    "DRINODE":           os.environ.get("DRINODE", ""),
+    "QT_QPA_PLATFORM":   "xcb",
+    "QT_PLUGIN_PATH":    "/usr/lib/x86_64-linux-gnu/qt6/plugins",
     "LD_PRELOAD":        "/usr/lib/selkies_joystick_interposer.so",
     "HOME":              "/config",
     "USER":              "abc",
-    "QT_QPA_PLATFORM":   "xcb",
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
@@ -391,7 +395,7 @@ def _pine_save_state(slot: int) -> bool:
 
 
 _XDOTOOL_ENV = {
-    "DISPLAY":         ":0",
+    "DISPLAY":         os.environ.get("DISPLAY", ":0"),
     "HOME":            "/config",
     "USER":            "abc",
     "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],

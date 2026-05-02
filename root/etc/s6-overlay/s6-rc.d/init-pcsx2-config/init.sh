@@ -1,5 +1,16 @@
 #!/usr/bin/with-contenv bash
 
+# Clean up stale Wayland and X11 sockets to ensure the compositor starts on the 
+# default display indices (wayland-0, :0) even if the container was killed 
+# forcefully.  Persistence of these lock files on the host-mapped /config 
+# folder causes them to increment (wayland-1, :1, etc.) on relaunch, which 
+# breaks the hardcoded display expectations of the broker and stream.
+XDG_RUNTIME_DIR="/config/.XDG"
+mkdir -p "$XDG_RUNTIME_DIR"
+find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
+rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
+echo "[broker-mod] Cleaned up stale display sockets."
+
 # Ensure python3 is available for the broker service.
 if ! command -v python3 &>/dev/null; then
     echo "[broker-mod] Installing python3..."
