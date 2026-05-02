@@ -40,7 +40,11 @@ ENV = {
     "WAYLAND_DISPLAY":   "wayland-1",
     "XDG_RUNTIME_DIR":   "/config/.XDG",
     "PULSE_RUNTIME_PATH":"/defaults",
-    "LD_PRELOAD":        "/usr/lib/selkies_joystick_interposer.so",
+    # LD_PRELOAD must include both the joystick interposer and the fake libudev
+    # — the latter lets SDL discover the synthetic /dev/input/js* devices that
+    # the linuxserver init script creates via mknod. Read from the container env
+    # to inherit whatever the base image set (currently both libs colon-separated).
+    "LD_PRELOAD":        os.environ.get("LD_PRELOAD", "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"),
     "HOME":              "/config",
     "USER":              "abc",
     "QT_QPA_PLATFORM":   "xcb",
