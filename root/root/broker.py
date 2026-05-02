@@ -22,19 +22,28 @@ PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
+def _detect_display() -> str:
+    """Return the actual X display by scanning /tmp/.X11-unix/. The DISPLAY env
+    var set by the linuxserver image is just a default — Xvfb may land elsewhere
+    if stale lock files exist (e.g. across container restarts on Podman)."""
+    try:
+        for sock in sorted(os.listdir("/tmp/.X11-unix")):
+            if sock.startswith("X") and sock[1:].isdigit():
+                return f":{sock[1:]}"
+    except OSError:
+        pass
+    return os.environ.get("DISPLAY", ":0")
+
+
 ENV = {
-    "DISPLAY":           os.environ.get("DISPLAY", ":0"),
-    "WAYLAND_DISPLAY":   os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    "DISPLAY":           _detect_display(),
+    "WAYLAND_DISPLAY":   "wayland-1",
     "XDG_RUNTIME_DIR":   "/config/.XDG",
     "PULSE_RUNTIME_PATH":"/defaults",
-    # DRI_NODE is needed for hardware acceleration.
-    "DRI_NODE":          os.environ.get("DRI_NODE", ""),
-    "DRINODE":           os.environ.get("DRINODE", ""),
-    "QT_QPA_PLATFORM":   "xcb",
-    "QT_PLUGIN_PATH":    "/usr/lib/x86_64-linux-gnu/qt6/plugins",
     "LD_PRELOAD":        "/usr/lib/selkies_joystick_interposer.so",
     "HOME":              "/config",
     "USER":              "abc",
+    "QT_QPA_PLATFORM":   "xcb",
 }
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
@@ -395,7 +404,7 @@ def _pine_save_state(slot: int) -> bool:
 
 
 _XDOTOOL_ENV = {
-    "DISPLAY":         os.environ.get("DISPLAY", ":0"),
+    "DISPLAY":         ENV["DISPLAY"],
     "HOME":            "/config",
     "USER":            "abc",
     "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
