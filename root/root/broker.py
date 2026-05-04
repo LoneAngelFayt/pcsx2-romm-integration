@@ -22,12 +22,29 @@ PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
+def _detect_display() -> str:
+    """Return the actual X display by scanning /tmp/.X11-unix/. The DISPLAY env
+    var set by the linuxserver image is just a default — Xvfb may land elsewhere
+    if stale lock files exist (e.g. across container restarts on Podman)."""
+    try:
+        for sock in sorted(os.listdir("/tmp/.X11-unix")):
+            if sock.startswith("X") and sock[1:].isdigit():
+                return f":{sock[1:]}"
+    except OSError:
+        pass
+    return os.environ.get("DISPLAY", ":0")
+
+
 ENV = {
-    "DISPLAY":           ":0",
+    "DISPLAY":           _detect_display(),
     "WAYLAND_DISPLAY":   "wayland-1",
     "XDG_RUNTIME_DIR":   "/config/.XDG",
     "PULSE_RUNTIME_PATH":"/defaults",
-    "LD_PRELOAD":        "/usr/lib/selkies_joystick_interposer.so",
+    # LD_PRELOAD must include both the joystick interposer and the fake libudev
+    # — the latter lets SDL discover the synthetic /dev/input/js* devices that
+    # the linuxserver init script creates via mknod. Read from the container env
+    # to inherit whatever the base image set (currently both libs colon-separated).
+    "LD_PRELOAD":        os.environ.get("LD_PRELOAD", "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"),
     "HOME":              "/config",
     "USER":              "abc",
     "QT_QPA_PLATFORM":   "xcb",
@@ -391,7 +408,7 @@ def _pine_save_state(slot: int) -> bool:
 
 
 _XDOTOOL_ENV = {
-    "DISPLAY":         ":0",
+    "DISPLAY":         ENV["DISPLAY"],
     "HOME":            "/config",
     "USER":            "abc",
     "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
