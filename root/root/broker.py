@@ -22,29 +22,87 @@ PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
-def _detect_display() -> str:
-    """Return the actual X display by scanning /tmp/.X11-unix/. The DISPLAY env
-    var set by the linuxserver image is just a default — Xvfb may land elsewhere
-    if stale lock files exist (e.g. across container restarts on Podman)."""
+XDG_RUNTIME_DIR = "/config/.XDG"
+
+
+def _live_x_sockets() -> list[Path]:
+    """Return X11 sockets that have a listening peer, newest first.
+    A bare /tmp/.X11-unix/X<N> file with no Xvfb behind it is a stale lock
+    that must be skipped or the broker will hand pcsx2-qt a dead display."""
+    candidates: list[tuple[float, Path]] = []
     try:
-        for sock in sorted(os.listdir("/tmp/.X11-unix")):
-            if sock.startswith("X") and sock[1:].isdigit():
-                return f":{sock[1:]}"
+        for entry in os.listdir("/tmp/.X11-unix"):
+            if not (entry.startswith("X") and entry[1:].isdigit()):
+                continue
+            p = Path("/tmp/.X11-unix") / entry
+            try:
+                st = p.stat()
+                with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    s.connect(str(p))
+                candidates.append((st.st_mtime, p))
+            except OSError:
+                continue
     except OSError:
         pass
-    return os.environ.get("DISPLAY", ":0")
+    candidates.sort(reverse=True)
+    return [p for _, p in candidates]
 
+
+def _detect_display(default: str = ":0") -> str:
+    """Return the live X display, preferring the most recently created socket.
+    Falls back to $DISPLAY then `default` if no live socket can be probed."""
+    live = _live_x_sockets()
+    if live:
+        return f":{live[0].name[1:]}"
+    return os.environ.get("DISPLAY", default)
+
+
+def _detect_wayland_display(default: str = "wayland-1") -> str:
+    """Return the most recent wayland-* socket name in $XDG_RUNTIME_DIR.
+    Falls back to $WAYLAND_DISPLAY then `default`."""
+    runtime = Path(XDG_RUNTIME_DIR)
+    try:
+        socks = sorted(
+            (p for p in runtime.iterdir() if p.name.startswith("wayland-") and p.is_socket()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if socks:
+            return socks[0].name
+    except OSError:
+        pass
+    return os.environ.get("WAYLAND_DISPLAY", default)
+
+
+def _wait_for_x_display(timeout: float = 30.0) -> str | None:
+    """Block until at least one live X socket appears, returning the display.
+    Returns None on timeout. Used at startup instead of a fixed sleep so the
+    broker doesn't race the desktop on slow hosts."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        live = _live_x_sockets()
+        if live:
+            return f":{live[0].name[1:]}"
+        time.sleep(0.25)
+    return None
+
+
+# LD_PRELOAD must include both the joystick interposer and the fake libudev
+# (the latter lets SDL discover the synthetic /dev/input/js* devices that the
+# linuxserver init creates via mknod). The base image normally exports it; if
+# it didn't, we fall back to the well-known paths but warn loudly so the
+# operator sees that gamepads may be silently broken.
+_LD_PRELOAD_DEFAULT = "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"
+_LD_PRELOAD = os.environ.get("LD_PRELOAD") or _LD_PRELOAD_DEFAULT
+_LD_PRELOAD_FROM_ENV = "LD_PRELOAD" in os.environ and bool(os.environ["LD_PRELOAD"])
 
 ENV = {
     "DISPLAY":           _detect_display(),
-    "WAYLAND_DISPLAY":   "wayland-1",
-    "XDG_RUNTIME_DIR":   "/config/.XDG",
+    "WAYLAND_DISPLAY":   _detect_wayland_display(),
+    "XDG_RUNTIME_DIR":   XDG_RUNTIME_DIR,
     "PULSE_RUNTIME_PATH":"/defaults",
-    # LD_PRELOAD must include both the joystick interposer and the fake libudev
-    # — the latter lets SDL discover the synthetic /dev/input/js* devices that
-    # the linuxserver init script creates via mknod. Read from the container env
-    # to inherit whatever the base image set (currently both libs colon-separated).
-    "LD_PRELOAD":        os.environ.get("LD_PRELOAD", "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"),
+    "LD_PRELOAD":        _LD_PRELOAD,
     "HOME":              "/config",
     "USER":              "abc",
     "QT_QPA_PLATFORM":   "xcb",
@@ -66,6 +124,21 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Warn if the linuxserver init didn't export LD_PRELOAD — gamepads silently
+# break when only the interposer is loaded without the fake libudev. Logged
+# here (after `log` exists) rather than at module import.
+if not _LD_PRELOAD_FROM_ENV:
+    log.warning(
+        "LD_PRELOAD not set in environment; falling back to %s. "
+        "If the linuxserver image moved these libraries, gamepads will not appear in PCSX2.",
+        _LD_PRELOAD_DEFAULT,
+    )
+
+# pcsx2-qt's own stdout/stderr is captured to this log so renderer/Vulkan/Qt
+# errors are visible after the fact. /config is the only host-mapped writable
+# path we can rely on.
+PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -94,39 +167,108 @@ def _validate_rom_path(raw: str) -> Path | None:
 
 
 def _patch_ini():
+    """Force broker-required PCSX2.ini settings. Each key is scoped to its
+    expected section so identically-named keys in other sections aren't stomped.
+    Failures are logged loudly — silent failure here means PCSX2 launches with
+    the wrong PINE/Fullscreen/Shutdown settings and downstream features break."""
     if not INI_PATH.exists():
         log.warning("PCSX2.ini not found at %s — skipping patch", INI_PATH)
         return
+
+    # (section, key) → "key = value" line.
+    patches: dict[tuple[str, str], str] = {
+        ("EmuCore",      "EnablePINE"):          "EnablePINE = true",
+        ("UI",           "StartFullscreen"):     "StartFullscreen = true",
+        ("UI",           "ConfirmShutdown"):     "ConfirmShutdown = false",
+        ("EmuCore",      "SaveStateOnShutdown"): "SaveStateOnShutdown = false",
+    }
+
     try:
-        patches = {
-            "EnablePINE":           "EnablePINE = true",
-            "StartFullscreen":      "StartFullscreen = true",
-            "ConfirmShutdown":      "ConfirmShutdown = false",
-            "SaveStateOnShutdown":  "SaveStateOnShutdown = false",
-        }
         lines = INI_PATH.read_text().splitlines()
-        applied = set()
-        new_lines = []
+        section = ""
+        applied: set[tuple[str, str]] = set()
+        new_lines: list[str] = []
         for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section = stripped[1:-1]
+                new_lines.append(line)
+                continue
             matched = False
-            for key, val in patches.items():
-                if line.strip().startswith(f"{key} =") or line.strip().startswith(f"{key}="):
+            for (sec, key), val in patches.items():
+                if section != sec:
+                    continue
+                if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
                     new_lines.append(val)
-                    applied.add(key)
+                    applied.add((sec, key))
                     matched = True
                     break
             if not matched:
                 new_lines.append(line)
-        for key, val in patches.items():
-            if key not in applied:
-                log.warning("PCSX2.ini: %s not found — appending without section header", key)
-                new_lines.append(val)
+
+        # Append missing keys under their target section header. If the section
+        # doesn't exist at all we create it so PCSX2 picks the value up.
+        missing = [(sec, key, val) for (sec, key), val in patches.items() if (sec, key) not in applied]
+        if missing:
+            present_sections = {l.strip()[1:-1] for l in new_lines if l.strip().startswith("[") and l.strip().endswith("]")}
+            for sec, _key, val in missing:
+                if sec in present_sections:
+                    # Insert immediately after the section header.
+                    out: list[str] = []
+                    inserted = False
+                    for l in new_lines:
+                        out.append(l)
+                        if not inserted and l.strip() == f"[{sec}]":
+                            out.append(val)
+                            inserted = True
+                    new_lines = out
+                else:
+                    new_lines.extend(["", f"[{sec}]", val])
+                    present_sections.add(sec)
+
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)  # atomic on POSIX; prevents partial-write corruption
         log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown, SaveStateOnShutdown)")
-    except Exception as exc:
-        log.error("Failed to patch PCSX2.ini: %s", exc)
+    except OSError as exc:
+        log.error("PCSX2.ini patch failed (filesystem): %s — broker settings NOT applied", exc)
+    except Exception:
+        log.exception("PCSX2.ini patch failed unexpectedly — broker settings NOT applied")
+
+
+def _read_initial_save_slot() -> int:
+    """Best-effort read of PCSX2's last-used save slot from PCSX2.ini.
+
+    PCSX2 persists the active save state slot in [EmuCore] under
+    `SaveStateSlot`. If the key is absent or the file is unreadable, fall
+    back to the BROKER_INITIAL_SLOT env var (default 1). Used by the launch
+    handler to seed the slot tracker so xdotool save-state cycling targets
+    the right slot on the first save after launch.
+    """
+    fallback = int(os.environ.get("BROKER_INITIAL_SLOT", "1"))
+    if not INI_PATH.exists():
+        return fallback
+    try:
+        section = ""
+        for raw in INI_PATH.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                continue
+            if section != "EmuCore":
+                continue
+            if line.startswith("SaveStateSlot =") or line.startswith("SaveStateSlot="):
+                _, _, value = line.partition("=")
+                try:
+                    n = int(value.strip())
+                except ValueError:
+                    return fallback
+                if 1 <= n <= 10:
+                    return n
+                return fallback
+    except OSError as exc:
+        log.debug("Could not read SaveStateSlot from PCSX2.ini: %s", exc)
+    return fallback
 
 
 def _kill_pcsx2():
@@ -168,25 +310,51 @@ def _launch_pcsx2_internal(rom_path):
     log.info("Launching PCSX2 (rom=%s)", rom_path or "dashboard")
     log.debug("Launching: %s", " ".join(cmd))
 
+    # Open the pcsx2-qt log in append mode so we keep history across launches.
+    # Failure to open it is non-fatal: emulator still launches, just without
+    # captured output. We try to keep the file under abc:abc so pcsx2-qt can
+    # write to it after sudo drops privileges.
+    try:
+        log_fh = open(PCSX2_LOG_PATH, "ab", buffering=0)
+        try:
+            os.chown(PCSX2_LOG_PATH, 1000, 1000)  # abc uid/gid in linuxserver images
+        except (OSError, PermissionError):
+            pass
+        log_fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch (rom={rom_path or 'dashboard'}) ===\n".encode())
+        log_fh.flush()
+    except OSError as exc:
+        log.warning("Cannot open %s for pcsx2-qt output capture (%s); continuing without capture.", PCSX2_LOG_PATH, exc)
+        log_fh = None
+
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh if log_fh else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
             preexec_fn=os.setpgrp,  # own process group so killpg is clean
         )
-    except Exception as exc:
+    except OSError as exc:
         log.error("Failed to launch PCSX2: %s", exc)
+        if log_fh:
+            log_fh.close()
         with _session_lock:
             _session["process"] = None
             _session["is_managed"] = False
         return
+    finally:
+        # Popen dup'd the fd; we can close our handle so it's not leaked.
+        if log_fh:
+            log_fh.close()
 
+    initial_slot = _read_initial_save_slot()
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
-        _session["current_slot"] = 1  # PCSX2 always starts at slot 1
-    log.info("PCSX2 launched (PID %d)", proc.pid)
+        # PCSX2's persisted slot from PCSX2.ini, or BROKER_INITIAL_SLOT.
+        # We can't query PCSX2 for its live slot, so this is a best-effort seed
+        # that tracks the same value PCSX2 itself loads on startup.
+        _session["current_slot"] = initial_slot
+    log.info("PCSX2 launched (PID %d, initial save slot %d)", proc.pid, initial_slot)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
 
@@ -212,7 +380,9 @@ def _monitor_process(proc, start_time):
             return
         _session["rom_path"] = None
         _session["rom_name"] = "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Dashboard is an idle state, not a session; clearing started_at lets
+        # /status reliably distinguish "playing" from "not playing".
+        _session["started_at"] = None
 
     _launch_pcsx2_internal(None)
 
@@ -262,15 +432,33 @@ def _drain_gamepad_sockets():
     )
 
 
+def _wait_for_no_pcsx2(timeout: float = 3.0) -> bool:
+    """Block until no `pcsx2-qt` process is running, up to `timeout` seconds.
+    Returns True if the process is gone, False on timeout. This replaces a
+    fixed sleep that papered over residual processes after _kill_pcsx2."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(["pgrep", "-x", "pcsx2-qt"], capture_output=True)
+        if result.returncode != 0:  # pgrep exits 1 when no process matches
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _launch_pcsx2(rom_path):
     _kill_pcsx2()
     _drain_gamepad_sockets()
     _patch_ini()
-    time.sleep(2)  # let drained handlers exit and the kill settle before launching
+    if not _wait_for_no_pcsx2():
+        log.warning("pcsx2-qt still running after kill+drain; relaunching anyway")
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Only stamp a session start when an actual ROM is being played. The
+        # dashboard is an idle state.
+        _session["started_at"] = (
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
+        )
     _launch_pcsx2_internal(rom_path)
 
 
@@ -398,8 +586,17 @@ def _pine_save_state(slot: int) -> bool:
             log.info("PINE: save command sent (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
             deadline = time.monotonic() + PINE_WAIT
             ok = _wait_for_sstate_write(before, deadline)
-    except Exception as exc:
-        log.error("PINE save state (slot %d) failed to send: %s", slot, exc)
+    except FileNotFoundError:
+        log.error("PINE save state (slot %d): socket %s vanished between discovery and connect", slot, socket_path)
+        return False
+    except ConnectionRefusedError:
+        log.error("PINE save state (slot %d): connection refused on %s — PCSX2 may have just exited", slot, socket_path)
+        return False
+    except _socket.timeout:
+        log.error("PINE save state (slot %d): timed out (>%.1fs) connecting/sending to %s", slot, PINE_TIMEOUT, socket_path)
+        return False
+    except OSError as exc:
+        log.error("PINE save state (slot %d): %s on %s (errno=%s)", slot, type(exc).__name__, socket_path, exc.errno)
         return False
 
     if not ok:
@@ -431,6 +628,7 @@ def _xdotool_find_window() -> str | None:
         + ["xdotool"]
     )
 
+    last_search_err: str | None = None
     for pid in pids:
         try:
             out = subprocess.check_output(
@@ -441,10 +639,16 @@ def _xdotool_find_window() -> str | None:
                 wid = ids[-1]  # last window is the main game surface
                 log.debug("xdotool: found window %s for PID %s", wid, pid)
                 return wid
-        except Exception as exc:
-            log.debug("xdotool: window search failed for PID %s: %s", pid, exc)
+        except subprocess.CalledProcessError as exc:
+            # Non-zero from xdotool = no match for this PID; expected during
+            # the brief period before the main window is mapped.
+            last_search_err = f"PID {pid}: exit {exc.returncode}"
+        except subprocess.TimeoutExpired:
+            log.warning("xdotool: search timed out for PID %s (X server slow or hung)", pid)
+        except OSError as exc:
+            log.warning("xdotool: failed to invoke for PID %s: %s", pid, exc)
 
-    # Fallback: search by class name
+    # Fallback: search by class name (case where window has no _NET_WM_PID).
     try:
         out = subprocess.check_output(
             xdo_base + ["search", "--onlyvisible", "--classname", "pcsx2-qt"], text=True, timeout=5,
@@ -454,10 +658,17 @@ def _xdotool_find_window() -> str | None:
             wid = ids[-1]
             log.debug("xdotool: found window %s by classname fallback", wid)
             return wid
-    except Exception as exc:
-        log.debug("xdotool: classname search failed: %s", exc)
+    except subprocess.CalledProcessError as exc:
+        last_search_err = f"classname: exit {exc.returncode}"
+    except subprocess.TimeoutExpired:
+        log.warning("xdotool: classname search timed out (X server slow or hung)")
+    except OSError as exc:
+        log.warning("xdotool: classname fallback failed to invoke: %s", exc)
 
-    log.error("xdotool: PCSX2 window not found")
+    log.warning(
+        "xdotool: PCSX2 window not found (PIDs %s, last error: %s) — F-key shortcuts will not be delivered",
+        pids, last_search_err,
+    )
     return None
 
 
@@ -491,8 +702,18 @@ def _xdotool_cycle_to_slot(wid: str, slot: int) -> bool:
             subprocess.run(
                 xdo_cmd + ["key", "--window", wid, key], timeout=5, check=True
             )
-        except Exception as exc:
-            log.error("xdotool: slot cycle failed: %s", exc)
+        except subprocess.CalledProcessError as exc:
+            log.error("xdotool: slot cycle keypress failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
+            with _session_lock:
+                _session["current_slot"] = current
+            return False
+        except subprocess.TimeoutExpired:
+            log.error("xdotool: slot cycle keypress timed out (window %s, key %s)", wid, key)
+            with _session_lock:
+                _session["current_slot"] = current
+            return False
+        except OSError as exc:
+            log.error("xdotool: failed to invoke for slot cycle: %s", exc)
             with _session_lock:
                 _session["current_slot"] = current
             return False
@@ -534,8 +755,14 @@ def _xdotool_save_state(slot: int) -> bool:
     )
     try:
         subprocess.run(xdo_cmd + ["key", "--window", wid, "F1"], timeout=5, check=True)
-    except Exception as exc:
-        log.error("xdotool: save key failed: %s", exc)
+    except subprocess.CalledProcessError as exc:
+        log.error("xdotool: F1 send failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("xdotool: F1 send timed out on window %s", wid)
+        return False
+    except OSError as exc:
+        log.error("xdotool: failed to invoke for F1: %s", exc)
         return False
 
     log.info(
@@ -564,8 +791,14 @@ def _xdotool_load_state(slot: int) -> bool:
     )
     try:
         subprocess.run(xdo_cmd + ["key", "--window", wid, "F3"], timeout=5, check=True)
-    except Exception as exc:
-        log.error("xdotool: load key failed: %s", exc)
+    except subprocess.CalledProcessError as exc:
+        log.error("xdotool: F3 send failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("xdotool: F3 send timed out on window %s", wid)
+        return False
+    except OSError as exc:
+        log.error("xdotool: failed to invoke for F3: %s", exc)
         return False
 
     log.info("xdotool: F3 sent to window %s (slot %d)", wid, slot)
@@ -726,6 +959,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
                 Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
             else:
+                # Clear visible session state synchronously so that callers
+                # polling /status immediately after this response observe
+                # "no game running" instead of stale rom_path. The background
+                # thread still runs the actual save+kill+relaunch.
+                with _session_lock:
+                    _session["rom_path"] = None
+                    _session["rom_name"] = "Dashboard"
+                    _session["started_at"] = None
+
                 def _bg(s):
                     try:
                         ok = _save_and_exit(s)
@@ -737,8 +979,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
                     _launch_pcsx2(None)
                 Thread(target=_bg, args=(slot,), daemon=True).start()
-                # Session state is not yet cleared when this response is sent;
-                # callers polling /status immediately may observe stale state.
                 self._send_json(200, {"status": "queued", "slot": slot})
             return
 
@@ -810,7 +1050,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "slot must be 1–10"})
                 return
             ok = _xdotool_load_state(slot)
-            self._send_json(200 if ok else 500, {"status": "ok" if ok else "error", "loaded": ok, "slot": slot})
+            if ok:
+                self._send_json(200, {"status": "ok", "loaded": True, "slot": slot})
+            else:
+                # 503: PCSX2 is the upstream and we couldn't reach its window
+                # (xdotool find/dispatch failed). The broker itself is healthy.
+                self._send_json(503, {
+                    "status": "error",
+                    "loaded": False,
+                    "slot": slot,
+                    "error": "could not deliver F3 to PCSX2 window (window not found or xdotool failure)",
+                })
             return
 
         if self.path != "/launch":
@@ -865,16 +1115,50 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
+    """Stop the HTTP listener, finish any in-flight save, then kill PCSX2.
+    Triggered on SIGTERM/SIGINT so `systemctl stop` doesn't drop a save mid-write."""
+    log.info("Received signal %d — beginning graceful shutdown", signum)
+    # Stop accepting new requests immediately so /save-and-exit can't race us.
+    Thread(target=server.shutdown, daemon=True).start()
+
+    # Wait briefly for any in-flight save to finish. The /save-and-exit handler
+    # holds save_in_progress for the duration of the F1+poll cycle.
+    deadline = time.monotonic() + max(PINE_WAIT, 5.0)
+    while time.monotonic() < deadline:
+        with _session_lock:
+            if not _session["save_in_progress"]:
+                break
+        time.sleep(0.2)
+    else:
+        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing PCSX2 anyway", PINE_WAIT)
+
+    _kill_pcsx2()
+    log.info("Shutdown complete")
+
+
 def main():
-    log.info("Broker starting — waiting 5s for desktop...")
-    time.sleep(5)
+    log.info("Broker starting — waiting for desktop X display...")
+    display = _wait_for_x_display(timeout=30.0)
+    if display is None:
+        log.error("No live X display appeared within 30s; pcsx2-qt will likely fail to launch")
+    else:
+        # Update ENV in case the display we found is different from the one
+        # we detected at module load time (Xvfb may not be up yet then).
+        ENV["DISPLAY"] = display
+        _XDOTOOL_ENV["DISPLAY"] = display
+        log.info("Desktop ready on DISPLAY=%s", display)
 
     # Safety net for stale processes on hot-reload; init-pcsx2-config already
     # disables the labwc autostart so this should normally find nothing.
-    result = subprocess.run(["pkill", "-9", "-f", "pcsx2-qt"], capture_output=True)
+    # -x: match the binary name exactly. -f matches the entire command line and
+    # would also kill processes that merely *mention* "pcsx2-qt" (editors, shells,
+    # log tailers, etc.).
+    result = subprocess.run(["pkill", "-9", "-x", "pcsx2-qt"], capture_output=True)
     if result.returncode == 0:
         log.info("Killed stale pcsx2-qt instance(s) on startup.")
-        time.sleep(2)
+        if not _wait_for_no_pcsx2(timeout=3.0):
+            log.warning("Stale pcsx2-qt instance still running after SIGKILL — OS may be slow")
 
     _patch_ini()
     _launch_pcsx2_internal(None)
@@ -884,9 +1168,18 @@ def main():
     if SECRET:
         log.info("Shared secret auth enabled")
 
+    # Install a single handler for both SIGTERM (systemd stop) and SIGINT
+    # (Ctrl-C). We intentionally don't use server.serve_forever()'s default
+    # KeyboardInterrupt path because it doesn't cover SIGTERM.
+    def _handle(signum, _frame):
+        _graceful_shutdown(server, signum)
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    finally:
         server.server_close()
 
 
