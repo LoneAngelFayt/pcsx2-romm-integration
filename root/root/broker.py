@@ -8,11 +8,10 @@ import logging
 import os
 import signal
 import socket as _socket
-import struct
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -110,9 +109,8 @@ ENV = {
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
-# PCSX2 2.x creates the PINE socket as pcsx2.sock (not pcsx2-{slot})
-PINE_SOCKET  = Path(os.environ.get("PINE_SOCKET", str(Path(ENV["XDG_RUNTIME_DIR"]) / "pcsx2.sock")))
-PINE_TIMEOUT = float(os.environ.get("PINE_TIMEOUT", "2.0"))   # connect + send timeout
+# Env var name kept as PINE_WAIT for backwards compatibility with existing
+# deployments; it now bounds the xdotool save-state write poll.
 PINE_WAIT    = float(os.environ.get("PINE_WAIT",   "20.0"))   # max seconds to poll for write completion
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "10"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
@@ -139,6 +137,11 @@ if not _LD_PRELOAD_FROM_ENV:
 # errors are visible after the fact. /config is the only host-mapped writable
 # path we can rely on.
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
+
+# UID/GID to chown the log to; defaults to the linuxserver abc user but honors
+# PUID/PGID overrides so pcsx2-qt can still write it on a remapped container.
+_LOG_UID = int(os.environ.get("PUID", "1000"))
+_LOG_GID = int(os.environ.get("PGID", "1000"))
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -290,7 +293,10 @@ def _kill_pcsx2():
         except subprocess.TimeoutExpired:
             log.warning("PCSX2 did not exit after SIGTERM — sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.error("PCSX2 did not exit after SIGKILL — giving up")
     except ProcessLookupError:
         pass  # already gone
 
@@ -317,7 +323,7 @@ def _launch_pcsx2_internal(rom_path):
     try:
         log_fh = open(PCSX2_LOG_PATH, "ab", buffering=0)
         try:
-            os.chown(PCSX2_LOG_PATH, 1000, 1000)  # abc uid/gid in linuxserver images
+            os.chown(PCSX2_LOG_PATH, _LOG_UID, _LOG_GID)
         except (OSError, PermissionError):
             pass
         log_fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} launch (rom={rom_path or 'dashboard'}) ===\n".encode())
@@ -462,30 +468,10 @@ def _launch_pcsx2(rom_path):
     _launch_pcsx2_internal(rom_path)
 
 
-def _find_pine_socket() -> Path | None:
-    """Locate PCSX2's PINE Unix socket. Tries the configured path first, then
-    falls back to a glob search so the correct name is discovered automatically."""
-    if PINE_SOCKET.exists():
-        return PINE_SOCKET
-    runtime_dir = Path(ENV["XDG_RUNTIME_DIR"])
-    for pattern in ("pcsx2-*", "pcsx2.sock"):
-        found = sorted(runtime_dir.glob(pattern))
-        if found:
-            log.debug("PINE: configured path %s absent — using %s", PINE_SOCKET, found[0])
-            return found[0]
-    for pattern in ("pcsx2-*", "pcsx2.sock"):
-        found = sorted(Path("/tmp").glob(pattern))
-        if found:
-            log.debug("PINE: found socket in /tmp at %s", found[0])
-            return found[0]
-    log.error("PINE: no socket found (looked in %s and /tmp)", runtime_dir)
-    return None
-
-
 def _sstate_snapshot() -> dict:
     """Return {Path: (size, mtime)} for every .p2s file currently in SSTATE_DIR."""
     if not SSTATE_DIR.is_dir():
-        log.debug("PINE: SSTATE_DIR absent — %s", SSTATE_DIR)
+        log.debug("Save: SSTATE_DIR absent — %s", SSTATE_DIR)
         return {}
     snap = {}
     for p in SSTATE_DIR.glob("*.p2s"):
@@ -494,7 +480,7 @@ def _sstate_snapshot() -> dict:
             snap[p] = (st.st_size, st.st_mtime)
         except OSError:
             pass
-    log.debug("PINE: snapshot — %d file(s) in %s", len(snap), SSTATE_DIR)
+    log.debug("Save: snapshot — %d file(s) in %s", len(snap), SSTATE_DIR)
     return snap
 
 
@@ -524,10 +510,10 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
                     target = p
                     last_size = size
                     stable_since = time.monotonic()
-                    log.debug("PINE: write detected — %s (%d bytes, mtime %.3f)", p.name, size, mtime)
+                    log.debug("Save: write detected — %s (%d bytes, mtime %.3f)", p.name, size, mtime)
                     break
                 else:
-                    log.debug("PINE: %s unchanged (mtime %.3f)", p.name, mtime)
+                    log.debug("Save: %s unchanged (mtime %.3f)", p.name, mtime)
         else:
             cur = after.get(target)
             if cur is None:
@@ -540,7 +526,7 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
                     stable_since = time.monotonic()
                 elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
                     log.info(
-                        "PINE: save state write complete — %s (%d bytes) in %.1fs",
+                        "Save: state write complete — %s (%d bytes) in %.1fs",
                         target.name, last_size,
                         time.monotonic() - start,
                     )
@@ -549,59 +535,6 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
         time.sleep(POLL_SECS)
 
     return False
-
-
-def _pine_save_state(slot: int) -> bool:
-    """Send MsgSaveState (opcode 9) to PCSX2 via the PINE Unix socket.
-
-    Wire format: [uint32 LE: payload length] [0x09] [slot byte]
-
-    Confirmed behaviour in PCSX2 2.6.3: the command is received and the save
-    state file IS written to SSTATE_DIR, but PCSX2 never sends a socket
-    response for any PINE opcode. The write can take 10–20 s for large games.
-    We close the socket immediately after sending and poll SSTATE_DIR for up
-    to PINE_WAIT seconds (default 20 s), stopping as soon as the write
-    stabilises.
-
-    Returns True if the command was successfully sent.
-    """
-    socket_path = _find_pine_socket()
-    if socket_path is None:
-        return False
-
-    before = _sstate_snapshot()
-
-    # MsgSaveState opcode = 9 per PCSX2 PINE IPC spec (pcsx2/PINE.cpp)
-    payload = bytes([9, slot & 0xFF])
-    msg = struct.pack("<I", len(payload)) + payload
-    try:
-        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
-            s.settimeout(PINE_TIMEOUT)
-            s.connect(str(socket_path))
-            s.sendall(msg)
-            # Keep the socket open while polling — PCSX2 only processes the
-            # command (and writes the save file) while the connection is alive.
-            # It attempts to write a response; closing early causes EPIPE and
-            # aborts the save.
-            log.info("PINE: save command sent (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
-            deadline = time.monotonic() + PINE_WAIT
-            ok = _wait_for_sstate_write(before, deadline)
-    except FileNotFoundError:
-        log.error("PINE save state (slot %d): socket %s vanished between discovery and connect", slot, socket_path)
-        return False
-    except ConnectionRefusedError:
-        log.error("PINE save state (slot %d): connection refused on %s — PCSX2 may have just exited", slot, socket_path)
-        return False
-    except _socket.timeout:
-        log.error("PINE save state (slot %d): timed out (>%.1fs) connecting/sending to %s", slot, PINE_TIMEOUT, socket_path)
-        return False
-    except OSError as exc:
-        log.error("PINE save state (slot %d): %s on %s (errno=%s)", slot, type(exc).__name__, socket_path, exc.errno)
-        return False
-
-    if not ok:
-        log.warning("PINE: save state write not detected within %.1fs — proceeding anyway", PINE_WAIT)
-    return True
 
 
 _XDOTOOL_ENV = {
@@ -832,11 +765,20 @@ _PACTL_CMD = [
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    """Run pactl as abc so it connects to abc's PulseAudio instance."""
-    return subprocess.run(
-        _PACTL_CMD + ["pactl"] + list(args),
-        capture_output=True, text=True, timeout=5,
-    )
+    """Run pactl as abc so it connects to abc's PulseAudio instance.
+
+    A hung or missing pactl is reported as a non-zero CompletedProcess (rather
+    than raising) so the /volume and /mute handlers return a 500 instead of
+    dropping the connection with an unhandled exception."""
+    cmd = _PACTL_CMD + ["pactl"] + list(args)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("pactl timed out: %s", " ".join(args))
+        return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
+    except OSError as exc:
+        log.error("pactl failed to run: %s", exc)
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def _pactl_get_volume() -> int | None:
@@ -858,6 +800,8 @@ def _pactl_get_mute() -> bool | None:
     """Return current mute state as bool, or None on error."""
     result = _pactl("get-sink-mute", "@DEFAULT_SINK@")
     if result.returncode != 0:
+        log.error("pactl get-sink-mute failed (rc=%s): %s",
+                  result.returncode, result.stderr.strip())
         return None
     return result.stdout.strip().endswith("yes")
 
@@ -888,7 +832,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict:
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
             length = 0
         if length == 0:
@@ -1022,10 +966,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _session["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 9):
+            if not isinstance(slot, int) or not (1 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–9"})
+                self._send_json(400, {"error": "slot must be 1–10"})
                 return
             def _bg_save(s):
                 try:
@@ -1163,10 +1107,15 @@ def main():
     _patch_ini()
     _launch_pcsx2_internal(None)
 
-    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    # ThreadingHTTPServer: /save-and-exit with wait=true blocks its handler for
+    # up to PINE_WAIT seconds; a single-threaded server would stall /health and
+    # /status for the duration. Session state is already lock-protected.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("ROM broker listening on port %d", PORT)
     if SECRET:
         log.info("Shared secret auth enabled")
+    else:
+        log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
 
     # Install a single handler for both SIGTERM (systemd stop) and SIGINT
     # (Ctrl-C). We intentionally don't use server.serve_forever()'s default

@@ -32,16 +32,24 @@ echo "[broker-mod] Disabled labwc autostart."
 # Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
 # Without this, idle gamepad sockets never detect client disconnection because
 # asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
-INPUT_HANDLER="/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py"
+# Glob over the python version so the patch survives base image upgrades that
+# bump e.g. python3.12 → python3.13.
+INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
+INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py}"
 if [ -f "$INPUT_HANDLER" ]; then
     if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies input_handler.py EOF patch already applied."
     else
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
-            "$INPUT_HANDLER" \
-            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
-        echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+            "$INPUT_HANDLER"
+        # Verify the substitution actually took — sed exits 0 even when the
+        # pattern never matched, so grep is the only honest success signal.
+        if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
+            echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+        else
+            echo "[broker-mod] ERROR: input_handler.py EOF pattern not found — patch NOT applied (upstream may have changed)"
+        fi
     fi
 
     # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle
