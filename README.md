@@ -1,6 +1,6 @@
 # pcsx2-romm-integration
 
-A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that integrates [PCSX2](https://pcsx2.net/) with [RomM](https://github.com/rommapp/romm) — launching PS2 games on demand from RomM's web UI and streaming the output back via Selkies.
+A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) for [PCSX2](https://pcsx2.net/) that connects to [RomM](https://github.com/rommapp/romm). Pick a game from the RomM web UI and the mod launches it in PCSX2, streaming the session back via Selkies.
 
 ---
 
@@ -10,7 +10,7 @@ This mod installs a small HTTP broker inside the [linuxserver/pcsx2](https://doc
 
 1. Exposes an API on port 8000 so RomM can request game launches
 2. Manages the PCSX2 process lifecycle (start, stop, game switching, dashboard mode)
-3. Saves game state via PCSX2's PINE IPC before exit
+3. Saves game state by sending an F-key to the PCSX2 window (via xdotool) before exit
 4. Patches Selkies and PCSX2 at init time for reliable controller and socket handling
 5. Supervises itself via s6-overlay (auto-restarts on crash)
 
@@ -63,9 +63,7 @@ docker compose up -d --force-recreate pcsx2
 | `BROKER_SECRET` | *(none)* | Shared secret for authentication. Sent as the `X-Broker-Secret` header. If unset, all requests are accepted — not recommended on a shared network. |
 | `BROKER_PORT` | `8000` | Port the broker HTTP server listens on. |
 | `ROM_ROOT` | `/romm/library` | Root path inside the container where ROMs are mounted. Requests with a `rom_path` outside this directory are rejected. |
-| `PINE_SOCKET` | `/config/.XDG/pcsx2.sock` | Path to PCSX2's PINE IPC socket. Auto-discovered if not present at this path. |
-| `PINE_TIMEOUT` | `2.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
-| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the PINE command. Polling stops early once the write is detected. Increase for slow disks or large games. |
+| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the save keypress. Polling stops early once the write is detected. Increase for slow disks or large games. (Name kept for backwards compatibility — the broker now confirms writes for the xdotool save path, not PINE.) |
 | `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
 
@@ -182,6 +180,49 @@ Save states are written to `SSTATE_DIR` as `{SERIAL} ({CRC}).{slot:02d}.p2s`.
 
 ---
 
+### `POST /save-state`
+
+Saves the current game to a slot without exiting. The keypress goes to the PCSX2 window via xdotool and the save runs in the background, so a `200` means the keystroke was sent — not that the write finished. Watch `/status` (`save_in_progress`) to confirm.
+
+```json
+{ "slot": 1 }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `slot` | `1` | Save state slot (1–10) |
+
+```json
+{ "status": "saving", "slot": 1 }
+```
+
+- Returns `409` if no game is running or a save is already in progress
+- Returns `400` if `slot` is not an integer 1–10
+
+---
+
+### `POST /load-state`
+
+Loads a save state into the running game. This one blocks until the keystroke is dispatched.
+
+```json
+{ "slot": 1 }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `slot` | `1` | Save state slot (1–10) |
+
+```json
+{ "status": "ok", "loaded": true, "slot": 1 }
+```
+
+- Returns `409` if no game is running
+- Returns `400` if `slot` is not an integer 1–10
+- Returns `503` if the PCSX2 window can't be reached (the broker itself is fine)
+
+---
+
 ### `POST /volume`
 
 Sets the audio output volume.
@@ -254,7 +295,7 @@ Expected on game launch:
 
 Expected on save-and-exit:
 ```
-14:25:45 [broker] INFO PINE: save command sent (slot 0) — waiting 3.0s for write
+14:25:45 [broker] INFO xdotool: F1 sent to window 0x3a00007 (slot 10) — waiting for write (max 20.0s)
 14:25:48 [broker] INFO Stopping PCSX2 (PID 123)...
 14:25:49 [broker] INFO Launching PCSX2 (rom=dashboard)
 14:25:49 [broker] INFO PCSX2 launched (PID 456)
@@ -287,8 +328,8 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 | Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key to PCSX2 window, slot 10 default |
 | Return to dashboard on exit | ✅ Done | Automatic after any exit path |
 | Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
-| Manual save state (no exit) | 🔜 Planned | `POST /save-state` with slot selection |
-| Manual load state | 🔜 Planned | `POST /load-state` with slot selection |
+| Manual save state (no exit) | ✅ Done | `POST /save-state` with slot selection |
+| Manual load state | ✅ Done | `POST /load-state` with slot selection |
 | RomM save state export/import | 🔜 Planned | Sync `.p2s` files from `SSTATE_DIR` to/from RomM library |
 
 ---
