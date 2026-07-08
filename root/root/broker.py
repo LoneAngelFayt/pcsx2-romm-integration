@@ -153,6 +153,7 @@ _session: dict = {
     "started_at":       None,
     "is_managed":       False,
     "save_in_progress": False,
+    "launch_in_progress": False,  # guards against concurrent /launch requests
     "current_slot":     1,      # tracks PCSX2's active save state slot (resets to 1 on each launch)
 }
 
@@ -452,20 +453,26 @@ def _wait_for_no_pcsx2(timeout: float = 3.0) -> bool:
 
 
 def _launch_pcsx2(rom_path):
-    _kill_pcsx2()
-    _drain_gamepad_sockets()
-    _patch_ini()
-    if not _wait_for_no_pcsx2():
-        log.warning("pcsx2-qt still running after kill+drain; relaunching anyway")
-    with _session_lock:
-        _session["rom_path"] = rom_path
-        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        # Only stamp a session start when an actual ROM is being played. The
-        # dashboard is an idle state.
-        _session["started_at"] = (
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
-        )
-    _launch_pcsx2_internal(rom_path)
+    try:
+        _kill_pcsx2()
+        _drain_gamepad_sockets()
+        _patch_ini()
+        if not _wait_for_no_pcsx2():
+            log.warning("pcsx2-qt still running after kill+drain; relaunching anyway")
+        with _session_lock:
+            _session["rom_path"] = rom_path
+            _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
+            # Only stamp a session start when an actual ROM is being played. The
+            # dashboard is an idle state.
+            _session["started_at"] = (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
+            )
+        _launch_pcsx2_internal(rom_path)
+    finally:
+        # Release the /launch claim. Harmless no-op for dashboard relaunches
+        # that never set it.
+        with _session_lock:
+            _session["launch_in_progress"] = False
 
 
 def _sstate_snapshot() -> dict:
@@ -826,7 +833,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -845,6 +851,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif not self._check_secret():
+            # /health stays open for container healthchecks; all other GETs
+            # require the shared secret, matching POST/DELETE.
+            self._send_json(403, {"error": "forbidden"})
         elif self.path == "/status":
             with _session_lock:
                 active = (
@@ -1011,11 +1021,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        with _session_lock:
-            if _session["save_in_progress"]:
-                self._send_json(409, {"error": "save in progress"})
-                return
-
         body = self._read_body()
         raw_path = body.get("rom_path", "").strip()
 
@@ -1034,6 +1039,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
             return
 
+        # Check save_in_progress and claim launch_in_progress in the same lock
+        # acquisition — checking them separately lets a save start in the gap,
+        # and the launch would then kill PCSX2 mid-savestate.
+        with _session_lock:
+            if _session["save_in_progress"]:
+                self._send_json(409, {"error": "save in progress"})
+                return
+            if _session["launch_in_progress"]:
+                self._send_json(409, {"error": "launch already in progress"})
+                return
+            _session["launch_in_progress"] = True
+
         Thread(target=_launch_pcsx2, args=(str(rom_path),), daemon=True).start()
         self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
@@ -1048,13 +1065,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
-        self.end_headers()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
