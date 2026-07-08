@@ -452,7 +452,7 @@ def _wait_for_no_pcsx2(timeout: float = 3.0) -> bool:
     return False
 
 
-def _launch_pcsx2(rom_path):
+def _launch_pcsx2(rom_path, release_claim=False):
     try:
         _kill_pcsx2()
         _drain_gamepad_sockets()
@@ -469,10 +469,12 @@ def _launch_pcsx2(rom_path):
             )
         _launch_pcsx2_internal(rom_path)
     finally:
-        # Release the /launch claim. Harmless no-op for dashboard relaunches
-        # that never set it.
-        with _session_lock:
-            _session["launch_in_progress"] = False
+        # Only the caller that claimed launch_in_progress (POST /launch) may
+        # release it — a dashboard relaunch clearing it unconditionally would
+        # wipe a concurrent /launch's claim and reopen the TOCTOU.
+        if release_claim:
+            with _session_lock:
+                _session["launch_in_progress"] = False
 
 
 def _sstate_snapshot() -> dict:
@@ -1051,7 +1053,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             _session["launch_in_progress"] = True
 
-        Thread(target=_launch_pcsx2, args=(str(rom_path),), daemon=True).start()
+        Thread(
+            target=_launch_pcsx2, args=(str(rom_path), True), daemon=True
+        ).start()
         self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
     def do_DELETE(self):
