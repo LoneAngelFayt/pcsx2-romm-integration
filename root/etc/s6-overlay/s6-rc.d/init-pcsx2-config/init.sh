@@ -11,11 +11,18 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[broker-mod] Cleaned up stale display sockets."
 
-# Ensure python3 is available for the broker service.
-if ! command -v python3 &>/dev/null; then
-    echo "[broker-mod] Installing python3..."
-    apt-get update -qq && apt-get install -y -qq python3 \
-        || echo "[broker-mod] ERROR: failed to install python3"
+# Ensure python3 is available for the broker service, and libshaderc for
+# PCSX2's Vulkan renderer — the base image ships without it, so on a host
+# with a GPU the GS device fails shader compilation and pcsx2-qt exits
+# within a second of booting any game (the gameless dashboard never
+# initializes GS, masking the breakage until a game is launched).
+_pkgs=()
+command -v python3 &>/dev/null || _pkgs+=(python3)
+ldconfig -p | grep -q libshaderc.so.1 || _pkgs+=(libshaderc1)
+if [ ${#_pkgs[@]} -gt 0 ]; then
+    echo "[broker-mod] Installing: ${_pkgs[*]}"
+    apt-get update -qq && apt-get install -y -qq "${_pkgs[@]}" \
+        || echo "[broker-mod] ERROR: failed to install ${_pkgs[*]}"
 fi
 
 # Lock down the sudoers rule so sudo accepts it (requires mode 0440).
