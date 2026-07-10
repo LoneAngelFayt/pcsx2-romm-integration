@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import socket as _socket
+import struct
 import subprocess
 import sys
 import time
@@ -109,8 +110,7 @@ ENV = {
 
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 
-# Env var name kept as PINE_WAIT for backwards compatibility with existing
-# deployments; it now bounds the xdotool save-state write poll.
+# Bounds the save-state write-confirmation poll (PINE and xdotool paths).
 PINE_WAIT    = float(os.environ.get("PINE_WAIT",   "20.0"))   # max seconds to poll for write completion
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "10"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
@@ -458,7 +458,14 @@ def _launch_pcsx2(rom_path, release_claim=False):
         _drain_gamepad_sockets()
         _patch_ini()
         if not _wait_for_no_pcsx2():
-            log.warning("pcsx2-qt still running after kill+drain; relaunching anyway")
+            # _kill_pcsx2 already reaped the managed process group, so any
+            # survivor is an unmanaged stray. Strays sit on top of the new
+            # game window, steal xdotool targeting, and unlink the live
+            # instance's PINE socket when they finally exit — reap them.
+            log.warning("Stray pcsx2-qt still running after kill+drain — sending SIGKILL")
+            subprocess.run(["pkill", "-9", "-x", "pcsx2-qt"], capture_output=True)
+            if not _wait_for_no_pcsx2():
+                log.error("Stray pcsx2-qt survived SIGKILL; new instance may misbehave")
         with _session_lock:
             _session["rom_path"] = rom_path
             _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
@@ -544,6 +551,98 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
         time.sleep(POLL_SECS)
 
     return False
+
+
+# ── PINE IPC ──────────────────────────────────────────────────────────────────
+# PCSX2's native IPC protocol. _patch_ini enables it (EnablePINE = true) and
+# pcsx2-qt listens on a unix socket in XDG_RUNTIME_DIR. Used as the primary
+# save/load-state channel: xdotool F-key delivery is unreliable against
+# pcsx2-qt (both XSendEvent and XTEST presses are dropped), so keypresses are
+# only a fallback for the window between launch and PINE socket creation.
+
+PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "pcsx2.sock"
+
+_PINE_MSG_SAVE_STATE = 0x09
+_PINE_MSG_LOAD_STATE = 0x0A
+
+
+def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
+    """Read exactly n bytes, or None if the peer closes early."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> bytes | None:
+    """Send one PINE request and return the reply payload, or None on failure.
+
+    Wire format (little-endian): request is u32 total packet size (including
+    the size field itself), u8 opcode, then payload. Reply is u32 size,
+    u8 result code (0 = OK), then reply payload.
+    """
+    packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(PINE_SOCKET))
+            sock.sendall(packet)
+            header = _pine_recv_exact(sock, 5)
+            if header is None:
+                log.warning("PINE: connection closed before reply header (opcode 0x%02X)", opcode)
+                return None
+            size, result = struct.unpack("<IB", header)
+            body = b""
+            if size > 5:
+                body = _pine_recv_exact(sock, size - 5) or b""
+            if result != 0:
+                log.warning("PINE: opcode 0x%02X rejected (result %d)", opcode, result)
+                return None
+            return body
+    except OSError as exc:
+        # socket.timeout is an OSError subclass, so this covers timeouts too.
+        log.warning("PINE: request failed on %s (opcode 0x%02X): %s", PINE_SOCKET, opcode, exc)
+        return None
+
+
+def _pine_save_state(slot: int) -> bool | None:
+    """Save state to `slot` via PINE.
+
+    Returns True on a confirmed state file write, False if PCSX2 accepted the
+    command but no write appeared within PINE_WAIT, and None if the PINE
+    request itself failed (caller should fall back to xdotool).
+    """
+    before = _sstate_snapshot()
+    if _pine_request(_PINE_MSG_SAVE_STATE, bytes([slot])) is None:
+        return None
+    # PCSX2 queues the save onto the VM thread and replies immediately, so
+    # confirm the actual write the same way the xdotool path does.
+    log.info("PINE: save state accepted (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
+    if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT):
+        return True
+    log.warning("PINE: save accepted but no state file write within %.1fs (slot %d)", PINE_WAIT, slot)
+    return False
+
+
+def _save_state(slot: int) -> bool:
+    """Save state via PINE, falling back to xdotool keypresses."""
+    result = _pine_save_state(slot)
+    if result is not None:
+        return result
+    log.warning("PINE unavailable — falling back to xdotool F-key delivery")
+    return _xdotool_save_state(slot)
+
+
+def _load_state(slot: int) -> bool:
+    """Load state via PINE, falling back to xdotool keypresses."""
+    if _pine_request(_PINE_MSG_LOAD_STATE, bytes([slot])) is not None:
+        log.info("PINE: load state accepted (slot %d)", slot)
+        return True
+    log.warning("PINE unavailable — falling back to xdotool F-key delivery")
+    return _xdotool_load_state(slot)
 
 
 _XDOTOOL_ENV = {
@@ -749,7 +848,7 @@ def _xdotool_load_state(slot: int) -> bool:
 
 def _save_and_exit(slot: int) -> bool:
     """Save emulator state then kill PCSX2. Returns True if save succeeded."""
-    ok = _xdotool_save_state(slot)
+    ok = _save_state(slot)
     _kill_pcsx2()
     return ok
 
@@ -985,7 +1084,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             def _bg_save(s):
                 try:
-                    ok = _xdotool_save_state(s)
+                    ok = _save_state(s)
                 finally:
                     with _session_lock:
                         _session["save_in_progress"] = False
@@ -1005,17 +1104,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 self._send_json(400, {"error": "slot must be 1–10"})
                 return
-            ok = _xdotool_load_state(slot)
+            ok = _load_state(slot)
             if ok:
                 self._send_json(200, {"status": "ok", "loaded": True, "slot": slot})
             else:
-                # 503: PCSX2 is the upstream and we couldn't reach its window
-                # (xdotool find/dispatch failed). The broker itself is healthy.
+                # 503: PCSX2 is the upstream and we couldn't reach it over
+                # PINE or xdotool. The broker itself is healthy.
                 self._send_json(503, {
                     "status": "error",
                     "loaded": False,
                     "slot": slot,
-                    "error": "could not deliver F3 to PCSX2 window (window not found or xdotool failure)",
+                    "error": "could not deliver load-state to PCSX2 (PINE and xdotool both failed)",
                 })
             return
 
@@ -1081,7 +1180,7 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     Thread(target=server.shutdown, daemon=True).start()
 
     # Wait briefly for any in-flight save to finish. The /save-and-exit handler
-    # holds save_in_progress for the duration of the F1+poll cycle.
+    # holds save_in_progress for the duration of the save request + write poll.
     deadline = time.monotonic() + max(PINE_WAIT, 5.0)
     while time.monotonic() < deadline:
         with _session_lock:
