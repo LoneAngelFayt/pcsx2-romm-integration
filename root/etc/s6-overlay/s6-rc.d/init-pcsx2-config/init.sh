@@ -25,6 +25,23 @@ if [ ${#_pkgs[@]} -gt 0 ]; then
         || echo "[broker-mod] ERROR: failed to install ${_pkgs[*]}"
 fi
 
+# Ubuntu's +dfsg PCSX2 package strips patches.zip from the resources dir,
+# so every game boot warns "Built-in game patches are not available" and
+# titles that rely on compatibility patches misbehave. Fetch the official
+# archive from the PCSX2 project. Non-fatal if offline: games still run.
+PATCHES_ZIP="/usr/share/PCSX2/resources/patches.zip"
+if [ ! -s "$PATCHES_ZIP" ]; then
+    echo "[broker-mod] Downloading PCSX2 patches.zip..."
+    if curl -fsSL -o "$PATCHES_ZIP" \
+        "https://github.com/PCSX2/pcsx2_patches/releases/latest/download/patches.zip"; then
+        chmod 644 "$PATCHES_ZIP"
+        echo "[broker-mod] patches.zip installed."
+    else
+        rm -f "$PATCHES_ZIP"
+        echo "[broker-mod] WARNING: patches.zip download failed; built-in game patches unavailable."
+    fi
+fi
+
 # Lock down the sudoers rule so sudo accepts it (requires mode 0440).
 chmod 0440 /etc/sudoers.d/broker
 echo "[broker-mod] sudoers rule set."
