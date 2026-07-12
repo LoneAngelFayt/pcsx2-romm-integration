@@ -65,7 +65,8 @@ docker compose up -d --force-recreate pcsx2
 | `ROM_ROOT` | `/romm/library` | Root path inside the container where ROMs are mounted. Requests with a `rom_path` outside this directory are rejected. |
 | `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the save keypress. Polling stops early once the write is detected. Increase for slow disks or large games. (Name kept for backwards compatibility — the broker now confirms writes for the xdotool save path, not PINE.) |
 | `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
-| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
+| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Served and written by the `/state-file` endpoints for RomM's save-state sync. |
+| `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish before serving the slot file. |
 
 ---
 
@@ -223,6 +224,34 @@ Loads a save state into the running game. This one blocks until the keystroke is
 
 ---
 
+### `GET /state-file?slot=N`
+
+Serves the newest `.p2s` state file for the slot as raw bytes, for RomM's centralized save-state sync. If a save is in flight the response blocks until the write completes (up to `STATE_GET_WAIT`, default 30 s), so a GET fired right after `/save-state` always carries the finished file.
+
+| Query param | Default | Description |
+|---|---|---|
+| `slot` | `0` | Save state slot (1–10); `0` resolves to `SAVE_SLOT` |
+
+- Response body is `application/octet-stream`; the emulator's own filename is echoed in the `X-State-Filename` header
+- Returns `404` if no state file exists for the slot
+- Returns `400` if `slot` is not an integer 0–10
+
+---
+
+### `PUT /state-file?filename=NAME`
+
+Writes a state file into the sstates directory, used by RomM to hydrate a freshly claimed container with the user's stored states. `NAME` is the filename a previous GET returned — written back verbatim so PCSX2 recognises the slot.
+
+- Body is the raw file content (`Content-Length` required, max 256 MB)
+- `NAME` must be a bare `.p2s` basename; path components are rejected
+- The write is atomic (temp file + rename) and the file is chowned to `abc` so PCSX2 can overwrite the slot later
+
+```json
+{ "status": "ok", "filename": "SLUS-12345 (ABCD1234).03.p2s" }
+```
+
+---
+
 ### `POST /volume`
 
 Sets the audio output volume.
@@ -330,7 +359,7 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 | Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
 | Manual save state (no exit) | ✅ Done | `POST /save-state` with slot selection |
 | Manual load state | ✅ Done | `POST /load-state` with slot selection |
-| RomM save state export/import | 🔜 Planned | Sync `.p2s` files from `SSTATE_DIR` to/from RomM library |
+| RomM save state export/import | ✅ Done | `GET`/`PUT /state-file` — RomM pulls saves into the library and hydrates slots on claim |
 
 ---
 

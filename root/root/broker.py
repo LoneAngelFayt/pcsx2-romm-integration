@@ -15,6 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
+from urllib.parse import parse_qs, urlparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -553,6 +554,42 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
     return False
 
 
+# ── State file transfer ───────────────────────────────────────────────────────
+# RomM's backend syncs save states through these helpers: after a save it
+# GETs the freshly written slot file, and on session claim it PUTs the user's
+# stored states back into SSTATE_DIR. GET blocks while a save is in flight so
+# the response always carries the completed write.
+
+STATE_FILE_MAX_BYTES = 256 * 1024 * 1024
+STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
+
+
+def _wait_for_save_idle(deadline: float) -> None:
+    """Block until no save is in flight, or the deadline passes."""
+    while time.monotonic() < deadline:
+        with _session_lock:
+            if not _session["save_in_progress"]:
+                return
+        time.sleep(0.2)
+
+
+def _newest_state_for_slot(slot: int) -> Path | None:
+    """Newest .p2s for the slot. PCSX2 names states `{serial} ({crc}).{slot:02d}.p2s`;
+    the bare-suffix glob covers older unpadded names."""
+    if not SSTATE_DIR.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for pattern in {f"*.{slot:02d}.p2s", f"*.{slot}.p2s"}:
+        for p in SSTATE_DIR.glob(pattern):
+            try:
+                candidates.append((p.stat().st_mtime, p))
+            except OSError:
+                pass
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
 # ── PINE IPC ──────────────────────────────────────────────────────────────────
 # PCSX2's native IPC protocol. _patch_ini enables it (EnablePINE = true) and
 # pcsx2-qt listens on a unix socket in XDG_RUNTIME_DIR. Used as the primary
@@ -949,6 +986,92 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _get_state_file(self):
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            slot = int(query.get("slot", ["0"])[0])
+        except ValueError:
+            self._send_json(400, {"error": "slot must be an integer"})
+            return
+        if slot == 0:
+            slot = SAVE_SLOT
+        if not (1 <= slot <= 10):
+            self._send_json(400, {"error": "slot must be 0–10"})
+            return
+
+        # Block while a save is being written so the caller never receives a
+        # half-written or stale file right after triggering a save.
+        _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT)
+
+        state_path = _newest_state_for_slot(slot)
+        if state_path is None:
+            self._send_json(404, {"error": "no state file for slot", "slot": slot})
+            return
+        try:
+            content = state_path.read_bytes()
+        except OSError as exc:
+            self._send_json(500, {"error": f"could not read state file: {exc}"})
+            return
+        if len(content) > STATE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "state file exceeds size limit"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-State-Filename", state_path.name)
+        self.end_headers()
+        self.wfile.write(content)
+        log.info("state-file: served %s (%d bytes)", state_path.name, len(content))
+
+    def do_PUT(self):
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+        parsed = urlparse(self.path)
+        if parsed.path != "/state-file":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        # Basename only — the filename came from a previous GET and is written
+        # back verbatim so PCSX2 recognises the slot; path parts are rejected.
+        raw_name = parse_qs(parsed.query).get("filename", [""])[0]
+        filename = Path(raw_name).name
+        if not filename or filename.startswith(".") or not filename.endswith(".p2s"):
+            self._send_json(400, {"error": "filename must be a .p2s basename"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or invalid Content-Length"})
+            return
+        if length > STATE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "state file exceeds size limit"})
+            return
+        content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
+
+        tmp = SSTATE_DIR / f".{filename}.tmp"
+        try:
+            SSTATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(content)
+            # PCSX2 runs as abc and must be able to overwrite the slot later.
+            os.chown(tmp, _LOG_UID, _LOG_GID)
+            os.replace(tmp, SSTATE_DIR / filename)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            self._send_json(500, {"error": f"could not write state file: {exc}"})
+            return
+        log.info("state-file: stored %s (%d bytes)", filename, length)
+        self._send_json(200, {"status": "ok", "filename": filename})
+
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
@@ -956,6 +1079,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # /health stays open for container healthchecks; all other GETs
             # require the shared secret, matching POST/DELETE.
             self._send_json(403, {"error": "forbidden"})
+        elif urlparse(self.path).path == "/state-file":
+            self._get_state_file()
         elif self.path == "/status":
             with _session_lock:
                 active = (
