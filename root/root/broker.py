@@ -116,6 +116,11 @@ PINE_WAIT    = float(os.environ.get("PINE_WAIT",   "20.0"))   # max seconds to p
 SAVE_SLOT    = int(os.environ.get("SAVE_SLOT", "10"))
 SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 
+# Resume-from-state (launch with load_slot): how long to wait for the game VM
+# to come up, and how long to let it settle before the deferred slot load.
+RESUME_LOAD_WAIT   = float(os.environ.get("RESUME_LOAD_WAIT",   "90.0"))
+RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "3.0"))
+
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [broker] %(levelname)s %(message)s",
@@ -601,6 +606,7 @@ PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "pcsx2.sock"
 
 _PINE_MSG_SAVE_STATE = 0x09
 _PINE_MSG_LOAD_STATE = 0x0A
+_PINE_MSG_EMU_STATUS = 0x0F
 
 
 def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
@@ -680,6 +686,35 @@ def _load_state(slot: int) -> bool:
         return True
     log.warning("PINE unavailable — falling back to xdotool F-key delivery")
     return _xdotool_load_state(slot)
+
+
+def _pine_emu_status() -> int | None:
+    """VM status via PINE: 0 running, 1 paused, 2 shutdown. None if PINE is down."""
+    body = _pine_request(_PINE_MSG_EMU_STATUS, timeout=2.0)
+    if body is None or len(body) < 4:
+        return None
+    return struct.unpack("<I", body[:4])[0]
+
+
+def _deferred_load_state(slot: int) -> None:
+    """Resume-from-state: load `slot` once the freshly launched game's VM is up.
+
+    Waits for the launch to finish swapping instances before trusting the
+    status probe — probing earlier could see a still-running previous game
+    and load the slot into the wrong VM. After the swap, only the new game
+    VM reports running (a gameless relaunch reports shutdown).
+    """
+    deadline = time.monotonic() + RESUME_LOAD_WAIT
+    while time.monotonic() < deadline:
+        with _session_lock:
+            launching = _session["launch_in_progress"]
+        if not launching and _pine_emu_status() == 0:
+            time.sleep(RESUME_LOAD_SETTLE)
+            ok = _load_state(slot)
+            log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
+            return
+        time.sleep(1.0)
+    log.warning("resume: VM never reached running state — slot %d not loaded", slot)
 
 
 _XDOTOOL_ENV = {
@@ -1265,6 +1300,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
             return
 
+        # Resume-from-state: load this slot once the game VM is up.
+        load_slot = body.get("load_slot")
+        if load_slot is not None and (
+            not isinstance(load_slot, int) or not (1 <= load_slot <= 10)
+        ):
+            self._send_json(400, {"error": "load_slot must be 1–10"})
+            return
+
         # Check save_in_progress and claim launch_in_progress in the same lock
         # acquisition — checking them separately lets a save start in the gap,
         # and the launch would then kill PCSX2 mid-savestate.
@@ -1280,6 +1323,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         Thread(
             target=_launch_pcsx2, args=(str(rom_path), True), daemon=True
         ).start()
+        if load_slot is not None:
+            Thread(
+                target=_deferred_load_state, args=(load_slot,), daemon=True
+            ).start()
         self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
     def do_DELETE(self):

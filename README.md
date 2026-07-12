@@ -67,6 +67,8 @@ docker compose up -d --force-recreate pcsx2
 | `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Served and written by the `/state-file` endpoints for RomM's save-state sync. |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish before serving the slot file. |
+| `RESUME_LOAD_WAIT` | `90.0` | Max seconds a `load_slot` launch waits for the new game VM to reach running state before giving up on the deferred state load. |
+| `RESUME_LOAD_SETTLE` | `3.0` | Seconds to let the game settle after the VM reports running, before the deferred `load_slot` state load fires. |
 
 ---
 
@@ -126,12 +128,13 @@ Returns `{"active": false, ...}` when no game is running.
 Kills any running game and launches a new ROM. Returns immediately; launch runs in a background thread.
 
 ```json
-{ "rom_path": "/romm/library/ps2/game.chd", "rom_name": "Game Title" }
+{ "rom_path": "/romm/library/ps2/game.chd", "rom_name": "Game Title", "load_slot": 3 }
 ```
 
 - `rom_path` must exist and be under `ROM_ROOT`
+- `load_slot` (optional, 1–10) — resume-from-state: once the game VM reports running (checked via PINE `EMU_STATUS`, up to `RESUME_LOAD_WAIT`, plus a `RESUME_LOAD_SETTLE` grace), the broker loads that state slot. Push the state file via `PUT /state-file` before launching.
 - Returns `409` if a save is in progress
-- Returns `400` if `rom_path` is missing or outside `ROM_ROOT`
+- Returns `400` if `rom_path` is missing or outside `ROM_ROOT`, or `load_slot` is not an integer 1–10
 - Returns `422` if `rom_path` does not exist
 
 ```json
