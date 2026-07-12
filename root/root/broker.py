@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import socket as _socket
 import struct
@@ -1136,6 +1137,149 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
     return (written, skipped)
 
 
+# ── Whole memory-card sync (per-user card model) ──────────────────────────────
+# Distinct from the /save-file mtime-merge path above: /memory-card ships and
+# replaces the ENTIRE Slot-1 folder card (superblock + every game folder) as one
+# host-independent image, so a user's card can be hydrated onto any pooled
+# container. GET evacuates the whole card; PUT wipes Slot 1 and lays the card
+# back down. Only Slot 1 is ever touched — Slot 2 is never synced.
+
+
+def _memcards_dir() -> Path:
+    return (_save_data_root() or _SAVE_DATA_ROOTS[0]) / "memcards"
+
+
+def _slot1_filename() -> str | None:
+    """Read [MemoryCards] Slot1_Filename from PCSX2.ini (manual parse, matching
+    _read_initial_save_slot). Returns the configured card name, or None."""
+    if not INI_PATH.exists():
+        return None
+    try:
+        section = ""
+        for raw in INI_PATH.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                continue
+            if section != "MemoryCards":
+                continue
+            if line.replace(" ", "").startswith("Slot1_Filename="):
+                _, _, value = line.partition("=")
+                return value.strip() or None
+    except OSError as exc:
+        log.debug("Could not read Slot1_Filename from PCSX2.ini: %s", exc)
+    return None
+
+
+def _slot1_card_path() -> Path | None:
+    """Absolute path to the Slot-1 memory card, existence-independent. None when
+    no Slot1_Filename is configured. A folder card is a DIRECTORY at this path; a
+    File card is a regular .ps2 file (rejected by the whole-card sync). The INI
+    value is a card name, so only its basename is honoured."""
+    name = _slot1_filename()
+    if not name:
+        return None
+    return _memcards_dir() / Path(name).name
+
+
+def _build_memory_card_archive() -> bytes | None | str:
+    """Zip the entire Slot-1 folder card, member paths relative to the card root
+    so the image is card-name independent. Returns the zip bytes, None when
+    Slot 1 has no folder card, or an error string when it is a File card."""
+    path = _slot1_card_path()
+    if path is None:
+        return None
+    if path.exists() and not path.is_dir():
+        return "slot 1 is a File memory card; a Folder card is required"
+    if not path.is_dir():
+        return None
+    files = [p for p in sorted(path.rglob("*")) if p.is_file() and not p.is_symlink()]
+    total = 0
+    for p in files:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    if total > SAVE_FILE_MAX_BYTES:
+        log.warning("memory-card: card exceeds size limit (%d bytes)", total)
+        return "memory card exceeds size limit"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            try:
+                zf.write(p, p.relative_to(path).as_posix())
+            except OSError as exc:
+                log.warning("memory-card: could not read %s — %s", p, exc)
+    return buf.getvalue()
+
+
+def _replace_memory_card(content: bytes) -> tuple[int] | str:
+    """Wipe the Slot-1 folder card and lay down the pulled card image. Returns
+    (written,) on success or an error string. The whole card is replaced (no
+    per-file mtime merge): this is the hydrate-with-isolation guarantee for
+    pooled containers. Extraction goes to a staging dir that is swapped over the
+    live card, so a mid-way failure never leaves a half-wiped card."""
+    path = _slot1_card_path()
+    if path is None:
+        return "no Slot 1 memory card configured in PCSX2.ini"
+    if path.exists() and not path.is_dir():
+        # This container is misprovisioned: hydrate needs a Folder card in slot 1.
+        # Log loudly so the offending host surfaces in monitoring, then refuse.
+        log.warning(
+            "memory-card: hydrate rejected on %s — slot 1 is a File card at %s",
+            _socket.gethostname(),
+            path,
+        )
+        return "slot 1 is a File memory card; a Folder card is required"
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return "body is not a zip archive"
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
+            return "archive exceeds size limit when extracted"
+        for info in infos:
+            member = PurePosixPath(info.filename)
+            if member.is_absolute() or ".." in member.parts:
+                return f"archive member escapes card dir: {info.filename}"
+
+        parent = path.parent
+        staging = parent / f".{path.name}.new-{os.getpid()}"
+        backup = parent / f".{path.name}.old-{os.getpid()}"
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            _mkdirs_owned(staging)
+            written = 0
+            for info in infos:
+                target = staging / PurePosixPath(info.filename)
+                _mkdirs_owned(target.parent)
+                tmp = target.parent / f".{target.name}.tmp"
+                tmp.write_bytes(zf.read(info))
+                os.chown(tmp, _LOG_UID, _LOG_GID)
+                os.replace(tmp, target)
+                written += 1
+            # Swap staging over the live card: move the old card aside, move the
+            # new one into place, then drop the old. Both live under memcards/,
+            # so the renames are atomic same-filesystem operations.
+            if path.exists():
+                os.replace(path, backup)
+            os.replace(staging, path)
+        except OSError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            # If we moved the old card aside but never put the new one in place,
+            # restore it so a mid-swap failure never leaves the user cardless.
+            if not path.exists() and backup.exists():
+                try:
+                    os.replace(backup, path)
+                except OSError:
+                    log.error("memory-card: could not restore card to %s", path)
+            return f"could not write memory card: {exc}"
+        finally:
+            shutil.rmtree(backup, ignore_errors=True)
+    return (written,)
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -1251,6 +1395,46 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
+    def _get_memory_card(self):
+        result = _build_memory_card_archive()
+        if isinstance(result, str):
+            # e.g. slot 1 is a File card, not a Folder card.
+            self._send_json(409, {"error": result})
+            return
+        if result is None:
+            self._send_json(404, {"error": "no folder memory card in slot 1"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(result)))
+        self.send_header("X-Memory-Card-Slot", "1")
+        self.end_headers()
+        self.wfile.write(result)
+        log.info("memory-card: served slot-1 card (%d bytes)", len(result))
+
+    def _put_memory_card(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or empty body"})
+            return
+        if length > SAVE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "archive too large"})
+            return
+        content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
+        result = _replace_memory_card(content)
+        if isinstance(result, str):
+            self._send_json(400, {"error": result})
+            return
+        (written,) = result
+        log.info("memory-card: replaced slot-1 card — %d files", written)
+        self._send_json(200, {"status": "ok", "written": written})
+
     def do_PUT(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
@@ -1258,6 +1442,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/save-file":
             self._put_save_file()
+            return
+        if parsed.path == "/memory-card":
+            self._put_memory_card()
             return
         if parsed.path != "/state-file":
             self._send_json(404, {"error": "not found"})
@@ -1314,6 +1501,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._get_state_file()
         elif urlparse(self.path).path == "/save-file":
             self._get_save_file()
+        elif urlparse(self.path).path == "/memory-card":
+            self._get_memory_card()
         elif self.path == "/status":
             with _session_lock:
                 active = (

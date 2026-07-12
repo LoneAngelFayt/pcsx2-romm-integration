@@ -56,6 +56,32 @@ docker compose up -d --force-recreate pcsx2
 
 ---
 
+## Memory Card Setup (required for save sync)
+
+**The PCSX2 memory card must be set to `Folder` type, not `File`.** This is the
+standard for this mod, and in-game save sync depends on it.
+
+A `File` card is a single monolithic 8 MB image holding every game's saves at
+once, so it cannot be synced per game or isolated per user. A `Folder` card
+stores each game in its own directory keyed by the game's serial ID (for
+example `BASLUS-20267DOTHACK/`), which is what lets the broker sync and hydrate
+one game's save without touching any other.
+
+Set it in PCSX2 under **Settings -> Memory Cards**: create a new card of type
+`Folder` and assign it to **Slot 1** (Slot 1 is the only slot synced). Confirm
+`inis/PCSX2.ini` shows the folder card on `Slot1_Filename`:
+
+```ini
+[MemoryCards]
+Slot1_Enable = true
+Slot1_Filename = my-folder-card.ps2   # this is a directory on disk, not a file
+```
+
+> Save **states** (`.p2s` snapshots, synced via `/state-file`) do not depend on
+> the memory card type. This requirement is only for in-game memory-card saves.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
