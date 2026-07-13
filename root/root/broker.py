@@ -1295,11 +1295,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             SECRET,
         )
 
-    def _send_json(self, code: int, body: dict) -> None:
+    def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1402,7 +1404,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": result})
             return
         if result is None:
-            self._send_json(404, {"error": "no folder memory card in slot 1"})
+            # Tag the "slot is empty" 404 so the backend can tell a genuinely
+            # empty card apart from a missing endpoint (an unmarked 404), which
+            # must NOT be treated as safe-to-wipe.
+            self._send_json(
+                404,
+                {"error": "no folder memory card in slot 1"},
+                headers={"X-Memory-Card": "absent"},
+            )
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
