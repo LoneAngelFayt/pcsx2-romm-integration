@@ -1034,14 +1034,24 @@ def _save_data_root() -> Path | None:
 
 def _iter_save_files(root: Path) -> list[Path]:
     """Every regular file under the allowed save subtrees, sorted for a
-    deterministic archive (identical content zips to identical bytes)."""
+    deterministic archive (identical content zips to identical bytes).
+
+    Dot-prefixed path components are excluded: the memory-card swap keeps
+    its staging/backup/tmp entries (.Card.new-*, .Card.old-*, .*.tmp) inside
+    memcards/, and those must never be swept into a save archive."""
     files: list[Path] = []
     for sub in SAVE_SYNC_SUBTREES:
         base = root / sub
         if not base.is_dir():
             continue
         files.extend(
-            p for p in sorted(base.rglob("*")) if p.is_file() and not p.is_symlink()
+            p
+            for p in sorted(base.rglob("*"))
+            if p.is_file()
+            and not p.is_symlink()
+            and not any(
+                part.startswith(".") for part in p.relative_to(base).parts
+            )
         )
     return files
 
@@ -1072,15 +1082,17 @@ def _read_file_stable(
     return None
 
 
-def _build_save_archive(baseline: float) -> tuple[bytes, int] | None | str:
+def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | str:
     """Zip every save file modified since the last game launch.
 
     Returns (zip_bytes, skipped) — `skipped` counts files left out because
-    they were unreadable or still being written — None when there is nothing
-    to sync (no data dir yet, or no file changed since `baseline`), or an
-    error string when the changed set exceeds the size limit. Member paths
-    are relative to the data dir so a later PUT restores them regardless of
-    which candidate dir is live."""
+    they were unreadable or still being written; zip_bytes is None when
+    every changed file was skipped, so the caller can refuse the pull
+    instead of serving an empty archive as a clean sync. Returns None when
+    there is nothing to sync (no data dir yet, or no file changed since
+    `baseline`), or an error string when the changed set exceeds the size
+    limit. Member paths are relative to the data dir so a later PUT
+    restores them regardless of which candidate dir is live."""
     root = _save_data_root()
     if root is None:
         log.debug("save-file: no PCSX2 data dir found")
@@ -1102,6 +1114,7 @@ def _build_save_archive(baseline: float) -> tuple[bytes, int] | None | str:
         return f"changed saves exceed size limit ({total} bytes)"
     buf = io.BytesIO()
     skipped = 0
+    wrote = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in changed:
             result = _read_file_stable(p)
@@ -1114,6 +1127,9 @@ def _build_save_archive(baseline: float) -> tuple[bytes, int] | None | str:
                 date_time=time.localtime(mtime)[:6],
             )
             zf.writestr(info, data, zipfile.ZIP_DEFLATED)
+            wrote += 1
+    if wrote == 0:
+        return None, skipped
     return buf.getvalue(), skipped
 
 
@@ -1431,6 +1447,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": result})
             return
         archive, unstable = result
+        if archive is None:
+            # Every changed file was mid-write; refuse rather than serve an
+            # empty archive the caller would record as a clean sync.
+            self._send_json(
+                503,
+                {"error": "save files are still being written; retry shortly"},
+            )
+            return
         # Header values must be latin-1; ROM stems can be anything.
         safe_name = "".join(
             c for c in (rom_name or "pcsx2") if c.isascii() and c.isprintable()
@@ -1606,13 +1630,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
+        path = urlparse(self.path).path
 
-        if self.path == "/cleanup":
+        if path == "/cleanup":
             Thread(target=_cleanup_sockets, daemon=True).start()
             self._send_json(200, {"status": "cleanup started"})
             return
 
-        if self.path == "/save-and-exit":
+        if path == "/save-and-exit":
             with _session_lock:
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -1671,7 +1696,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "queued", "slot": slot})
             return
 
-        if self.path == "/volume":
+        if path == "/volume":
             body = self._read_body()
             if body is None:
                 return
@@ -1687,7 +1712,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "level": level})
             return
 
-        if self.path == "/mute":
+        if path == "/mute":
             body = self._read_body()
             if body is None:
                 return
@@ -1704,7 +1729,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "mute": mute_state})
             return
 
-        if self.path == "/save-state":
+        if path == "/save-state":
             with _session_lock:
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -1736,7 +1761,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "saving", "slot": slot})
             return
 
-        if self.path == "/load-state":
+        if path == "/load-state":
             with _session_lock:
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -1762,7 +1787,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 })
             return
 
-        if self.path != "/launch":
+        if path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
 
@@ -1819,7 +1844,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
-        if self.path != "/launch":
+        if urlparse(self.path).path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
 
