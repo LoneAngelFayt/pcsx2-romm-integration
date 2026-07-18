@@ -26,6 +26,10 @@ PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
+# JSON request bodies are tiny (a rom_path, a slot number); anything larger
+# is rejected with 413 rather than silently truncated.
+_BODY_MAX_BYTES = 64 * 1024
+
 XDG_RUNTIME_DIR = "/config/.XDG"
 
 
@@ -895,8 +899,11 @@ def _xdotool_save_state(slot: int) -> bool:
     )
     deadline = time.monotonic() + PINE_WAIT
     if not _wait_for_sstate_write(before, deadline):
+        # Same contract as _pine_save_state: an unconfirmed write is a failed
+        # save, so callers never report saved=true for a state that may not exist.
         log.warning("xdotool: save state write not confirmed within %.1fs (F1 was sent)", PINE_WAIT)
-    return True  # F1 was delivered; write detection is best-effort confirmation
+        return False
+    return True
 
 
 def _xdotool_load_state(slot: int) -> bool:
@@ -1039,12 +1046,41 @@ def _iter_save_files(root: Path) -> list[Path]:
     return files
 
 
-def _build_save_archive(baseline: float) -> bytes | None:
+def _read_file_stable(
+    p: Path, retries: int = 4, settle: float = 0.5
+) -> tuple[bytes, float] | None:
+    """Read `p` only when its size/mtime are identical before and after the
+    read, so a file PCSX2 is mid-writing is never shipped torn. Returns
+    (contents, mtime), or None when the file stays unstable through every
+    retry or cannot be read."""
+    for attempt in range(retries):
+        try:
+            st_before = p.stat()
+            data = p.read_bytes()
+            st_after = p.stat()
+        except OSError as exc:
+            log.warning("save-file: could not read %s — %s", p, exc)
+            return None
+        if (st_before.st_size, st_before.st_mtime_ns) == (
+            st_after.st_size,
+            st_after.st_mtime_ns,
+        ):
+            return data, st_after.st_mtime
+        if attempt < retries - 1:
+            time.sleep(settle)
+    log.warning("save-file: %s still being written — skipped this pull", p)
+    return None
+
+
+def _build_save_archive(baseline: float) -> tuple[bytes, int] | None | str:
     """Zip every save file modified since the last game launch.
 
-    Returns None when there is nothing to sync — no data dir yet, or no file
-    changed since `baseline`. Member paths are relative to the data dir so a
-    later PUT restores them regardless of which candidate dir is live."""
+    Returns (zip_bytes, skipped) — `skipped` counts files left out because
+    they were unreadable or still being written — None when there is nothing
+    to sync (no data dir yet, or no file changed since `baseline`), or an
+    error string when the changed set exceeds the size limit. Member paths
+    are relative to the data dir so a later PUT restores them regardless of
+    which candidate dir is live."""
     root = _save_data_root()
     if root is None:
         log.debug("save-file: no PCSX2 data dir found")
@@ -1063,15 +1099,22 @@ def _build_save_archive(baseline: float) -> bytes | None:
         return None
     if total > SAVE_FILE_MAX_BYTES:
         log.warning("save-file: changed saves exceed size limit (%d bytes)", total)
-        return None
+        return f"changed saves exceed size limit ({total} bytes)"
     buf = io.BytesIO()
+    skipped = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in changed:
-            try:
-                zf.write(p, p.relative_to(root).as_posix())
-            except OSError as exc:
-                log.warning("save-file: could not read %s — %s", p, exc)
-    return buf.getvalue()
+            result = _read_file_stable(p)
+            if result is None:
+                skipped += 1
+                continue
+            data, mtime = result
+            info = zipfile.ZipInfo(
+                p.relative_to(root).as_posix(),
+                date_time=time.localtime(mtime)[:6],
+            )
+            zf.writestr(info, data, zipfile.ZIP_DEFLATED)
+    return buf.getvalue(), skipped
 
 
 def _mkdirs_owned(path: Path) -> None:
@@ -1273,10 +1316,17 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
                 try:
                     os.replace(backup, path)
                 except OSError:
-                    log.error("memory-card: could not restore card to %s", path)
-            return f"could not write memory card: {exc}"
-        finally:
+                    # The backup is now the only surviving copy of the card —
+                    # leave it on disk for manual recovery instead of deleting it.
+                    log.error(
+                        "memory-card: could not restore card to %s — old card preserved at %s",
+                        path,
+                        backup,
+                    )
+                    return f"could not write memory card: {exc}"
             shutil.rmtree(backup, ignore_errors=True)
+            return f"could not write memory card: {exc}"
+        shutil.rmtree(backup, ignore_errors=True)
     return (written,)
 
 
@@ -1305,17 +1355,29 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict | None:
+        """Parse the JSON request body. Returns {} for an absent body. Sends
+        the error response itself and returns None when the body is oversized
+        or not a JSON object — callers must bail out on None."""
         try:
-            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
+            length = int(self.headers.get("Content-Length", 0))
         except ValueError:
             length = 0
-        if length == 0:
+        if length <= 0:
             return {}
+        if length > _BODY_MAX_BYTES:
+            self._send_json(413, {"error": "request body too large"})
+            return None
+        raw = self.rfile.read(length)
         try:
-            return json.loads(self.rfile.read(length))
+            body = json.loads(raw)
         except json.JSONDecodeError:
-            return {}
+            self._send_json(400, {"error": "body is not valid JSON"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "body must be a JSON object"})
+            return None
+        return body
 
     def _get_state_file(self):
         query = parse_qs(urlparse(self.path).query)
@@ -1361,10 +1423,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if baseline is None:
             self._send_json(404, {"error": "no game has been launched"})
             return
-        archive = _build_save_archive(baseline)
-        if archive is None:
+        result = _build_save_archive(baseline)
+        if result is None:
             self._send_json(404, {"error": "no save changes since last launch"})
             return
+        if isinstance(result, str):
+            self._send_json(413, {"error": result})
+            return
+        archive, unstable = result
         # Header values must be latin-1; ROM stems can be anything.
         safe_name = "".join(
             c for c in (rom_name or "pcsx2") if c.isascii() and c.isprintable()
@@ -1373,9 +1439,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(archive)))
         self.send_header("X-Save-Filename", f"{safe_name}.saves.zip")
+        if unstable:
+            # Files skipped mid-write; the caller can tell this pull was partial.
+            self.send_header("X-Save-Skipped-Unstable", str(unstable))
         self.end_headers()
         self.wfile.write(archive)
-        log.info("save-file: served archive (%d bytes)", len(archive))
+        log.info(
+            "save-file: served archive (%d bytes, %d unstable skipped)",
+            len(archive),
+            unstable,
+        )
 
     def _put_save_file(self):
         try:
@@ -1500,19 +1573,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok", "filename": filename})
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urlparse(self.path).path
+        if path == "/health":
             self._send_json(200, {"status": "ok"})
         elif not self._check_secret():
             # /health stays open for container healthchecks; all other GETs
             # require the shared secret, matching POST/DELETE.
             self._send_json(403, {"error": "forbidden"})
-        elif urlparse(self.path).path == "/state-file":
+        elif path == "/state-file":
             self._get_state_file()
-        elif urlparse(self.path).path == "/save-file":
+        elif path == "/save-file":
             self._get_save_file()
-        elif urlparse(self.path).path == "/memory-card":
+        elif path == "/memory-card":
             self._get_memory_card()
-        elif self.path == "/status":
+        elif path == "/status":
             with _session_lock:
                 active = (
                     _session["process"] is not None
@@ -1548,6 +1622,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
+            if body is None:
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                return
             slot = body.get("slot", SAVE_SLOT)
             if not isinstance(slot, int) or not (0 <= slot <= 10):
                 with _session_lock:
@@ -1595,6 +1673,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/volume":
             body = self._read_body()
+            if body is None:
+                return
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
                 self._send_json(400, {"error": "level must be an integer 0–100"})
@@ -1609,6 +1689,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/mute":
             body = self._read_body()
+            if body is None:
+                return
             if "mute" in body:
                 mute_arg = "1" if body["mute"] else "0"
             else:
@@ -1632,6 +1714,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _session["save_in_progress"] = True
             body = self._read_body()
+            if body is None:
+                with _session_lock:
+                    _session["save_in_progress"] = False
+                return
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 with _session_lock:
@@ -1656,6 +1742,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "no game is running"})
                     return
             body = self._read_body()
+            if body is None:
+                return
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 self._send_json(400, {"error": "slot must be 1–10"})
@@ -1679,6 +1767,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
+        if body is None:
+            return
         raw_path = body.get("rom_path", "").strip()
 
         if not raw_path:

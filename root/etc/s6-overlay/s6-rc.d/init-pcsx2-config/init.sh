@@ -32,13 +32,21 @@ fi
 PATCHES_ZIP="/usr/share/PCSX2/resources/patches.zip"
 if [ ! -s "$PATCHES_ZIP" ]; then
     echo "[broker-mod] Downloading PCSX2 patches.zip..."
-    if curl -fsSL -o "$PATCHES_ZIP" \
-        "https://github.com/PCSX2/pcsx2_patches/releases/latest/download/patches.zip"; then
-        chmod 644 "$PATCHES_ZIP"
+    # Download to a temp path and verify it is a well-formed zip before
+    # installing — the release URL floats ("latest"), so a checksum can't be
+    # pinned, but a truncated or non-zip response must never land in place.
+    if curl -fsSL -o "$PATCHES_ZIP.tmp" \
+        "https://github.com/PCSX2/pcsx2_patches/releases/latest/download/patches.zip" \
+        && python3 -c 'import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    sys.exit(1 if z.testzip() is not None or not z.namelist() else 0)' \
+            "$PATCHES_ZIP.tmp" 2>/dev/null; then
+        chmod 644 "$PATCHES_ZIP.tmp"
+        mv "$PATCHES_ZIP.tmp" "$PATCHES_ZIP"
         echo "[broker-mod] patches.zip installed."
     else
-        rm -f "$PATCHES_ZIP"
-        echo "[broker-mod] WARNING: patches.zip download failed; built-in game patches unavailable."
+        rm -f "$PATCHES_ZIP.tmp"
+        echo "[broker-mod] WARNING: patches.zip download failed or corrupt; built-in game patches unavailable."
     fi
 fi
 
