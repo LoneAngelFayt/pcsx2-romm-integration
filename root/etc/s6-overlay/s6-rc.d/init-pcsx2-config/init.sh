@@ -7,9 +7,15 @@
 # breaks the hardcoded display expectations of the broker and stream.
 XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"
-find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
-rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
-echo "[broker-mod] Cleaned up stale display sockets."
+# Only clean when no display server is alive — if s6 ordering ever changes
+# and the compositor is already up, deleting its live socket kills the stream.
+if pgrep -x Xvfb >/dev/null || pgrep -x Xwayland >/dev/null || pgrep -x labwc >/dev/null; then
+    echo "[broker-mod] Display server already running — skipping socket cleanup."
+else
+    find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
+    rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
+    echo "[broker-mod] Cleaned up stale display sockets."
+fi
 
 # Ensure python3 is available for the broker service, and libshaderc for
 # PCSX2's Vulkan renderer — the base image ships without it, so on a host
@@ -35,7 +41,9 @@ if [ ! -s "$PATCHES_ZIP" ]; then
     # Download to a temp path and verify it is a well-formed zip before
     # installing — the release URL floats ("latest"), so a checksum can't be
     # pinned, but a truncated or non-zip response must never land in place.
-    if curl -fsSL -o "$PATCHES_ZIP.tmp" \
+    # Bounded so an unresponsive GitHub can't stall container init for an
+    # optional file.
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$PATCHES_ZIP.tmp" \
         "https://github.com/PCSX2/pcsx2_patches/releases/latest/download/patches.zip" \
         && python3 -c 'import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:

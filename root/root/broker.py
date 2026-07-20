@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """broker.py — launch PCSX2 on demand and expose a small HTTP API."""
 
+import calendar
 import glob
 import hmac
 import io
@@ -166,7 +167,12 @@ _session: dict = {
     "started_at":       None,
     "is_managed":       False,
     "save_in_progress": False,
-    "launch_in_progress": False,  # guards against concurrent /launch requests
+    "launch_in_progress": False,  # claim shared by every kill+relaunch path
+    "launch_seq":       0,      # bumped per launch; stale deferred loads abort
+    "card_op_in_progress": False,  # a /memory-card replace is mid-flight
+    # Set when the crash-loop limiter gives up. /status exposes it so a pooled
+    # fleet can tell "idle, waiting for a user" from "broker surrendered".
+    "relaunch_abandoned": False,
     "current_slot":     1,      # tracks PCSX2's active save state slot (resets to 1 on each launch)
     # Wall-clock stamp of the last GAME launch (not dashboard relaunches).
     # GET /save-file only ships files modified at or after this point; it
@@ -355,7 +361,10 @@ def _launch_pcsx2_internal(rom_path):
             cmd,
             stdout=log_fh if log_fh else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
-            preexec_fn=os.setpgrp,  # own process group so killpg is clean
+            # New session ⇒ own process group, so killpg is clean. Unlike
+            # preexec_fn (unsafe with threads — can deadlock between fork and
+            # exec in this ThreadingHTTPServer process), this is thread-safe.
+            start_new_session=True,
         )
     except OSError as exc:
         log.error("Failed to launch PCSX2: %s", exc)
@@ -374,6 +383,8 @@ def _launch_pcsx2_internal(rom_path):
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
+        # An instance is up again — whatever the limiter concluded is stale.
+        _session["relaunch_abandoned"] = False
         # PCSX2's persisted slot from PCSX2.ini, or BROKER_INITIAL_SLOT.
         # We can't query PCSX2 for its live slot, so this is a best-effort seed
         # that tracks the same value PCSX2 itself loads on startup.
@@ -382,15 +393,43 @@ def _launch_pcsx2_internal(rom_path):
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
 
+# Consecutive sub-5s exits before the monitor stops relaunching. A pcsx2-qt
+# that dies instantly every time (missing lib, dead display) must not respawn
+# forever; an explicit POST /launch resets the counter so recovery is manual.
+_CRASH_LOOP_LIMIT = 3
+_rapid_exits = 0  # guarded by _session_lock
+
+
 def _monitor_process(proc, start_time):
     """On unexpected exit, relaunch into dashboard mode if the session is still managed."""
+    global _rapid_exits
     proc.wait()
     duration = time.monotonic() - start_time
 
+    rapid = 0
     with _session_lock:
         should_relaunch = _session["is_managed"] and _session["process"] is proc
+        # Only unexpected exits count toward the crash-loop limit — a
+        # deliberate kill (/save-and-exit, DELETE /launch) cleared is_managed
+        # and must not push the counter toward a false trip.
+        if should_relaunch:
+            if duration < 5:
+                _rapid_exits += 1
+            else:
+                _rapid_exits = 0
+            rapid = _rapid_exits
 
     if not should_relaunch:
+        return
+
+    if rapid >= _CRASH_LOOP_LIMIT:
+        log.error(
+            "PCSX2 exited within 5s %d times in a row — giving up on relaunch. "
+            "Fix the underlying failure, then POST /launch to recover.",
+            rapid,
+        )
+        with _session_lock:
+            _session["relaunch_abandoned"] = True
         return
 
     # Back off if the process died almost immediately to avoid a tight crash loop.
@@ -398,17 +437,30 @@ def _monitor_process(proc, start_time):
     log.info("PCSX2 exited after %.1fs — relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
 
-    with _session_lock:
-        # Re-check: _kill_pcsx2 may have fired during the sleep above.
-        if not _session["is_managed"]:
-            return
-        _session["rom_path"] = None
-        _session["rom_name"] = "Dashboard"
-        # Dashboard is an idle state, not a session; clearing started_at lets
-        # /status reliably distinguish "playing" from "not playing".
-        _session["started_at"] = None
-
-    _launch_pcsx2_internal(None)
+    # The crash relaunch is a lifecycle sequence like any other: it must hold
+    # the launch claim, or a concurrent /launch interleaves with it and the
+    # monitor stomps the new game's session state with Dashboard.
+    if not _claim_launch():
+        log.info("Crash relaunch skipped — a launch is already in progress")
+        return
+    try:
+        with _session_lock:
+            # Re-check under the claim: _kill_pcsx2 ended the session, or a
+            # /launch that completed before we claimed installed a new process
+            # (in which case `process` is no longer OUR dead proc).
+            if not _session["is_managed"] or _session["process"] is not proc:
+                return
+            # Supersede any deferred slot load still pending for the dead launch.
+            _session["launch_seq"] += 1
+            _session["rom_path"] = None
+            _session["rom_name"] = "Dashboard"
+            # Dashboard is an idle state, not a session; clearing started_at lets
+            # /status reliably distinguish "playing" from "not playing".
+            _session["started_at"] = None
+        _launch_pcsx2_internal(None)
+    finally:
+        with _session_lock:
+            _session["launch_in_progress"] = False
 
 
 def _drain_gamepad_sockets():
@@ -469,7 +521,18 @@ def _wait_for_no_pcsx2(timeout: float = 3.0) -> bool:
     return False
 
 
-def _launch_pcsx2(rom_path, release_claim=False):
+def _claim_launch() -> bool:
+    """Atomically claim launch_in_progress. Every kill+relaunch path must hold
+    this claim so two lifecycle sequences can never interleave."""
+    with _session_lock:
+        if _session["launch_in_progress"]:
+            return False
+        _session["launch_in_progress"] = True
+        return True
+
+
+def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
+    global _rapid_exits
     try:
         _kill_pcsx2()
         _drain_gamepad_sockets()
@@ -484,6 +547,11 @@ def _launch_pcsx2(rom_path, release_claim=False):
             if not _wait_for_no_pcsx2():
                 log.error("Stray pcsx2-qt survived SIGKILL; new instance may misbehave")
         with _session_lock:
+            # An explicit launch is a fresh start: clear the crash-loop counter
+            # and supersede any pending deferred slot load from a prior launch.
+            _rapid_exits = 0
+            _session["launch_seq"] += 1
+            seq = _session["launch_seq"]
             _session["rom_path"] = rom_path
             _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
             # Only stamp a session start when an actual ROM is being played. The
@@ -496,13 +564,66 @@ def _launch_pcsx2(rom_path, release_claim=False):
             if rom_path:
                 _session["save_baseline"] = time.time()
         _launch_pcsx2_internal(rom_path)
+        if load_slot is not None:
+            # Spawned here (not by the HTTP handler) so the deferred loader
+            # carries this launch's seq and aborts if a later launch lands.
+            # Skipped when Popen failed — no point polling PINE for
+            # RESUME_LOAD_WAIT against a VM that never started.
+            with _session_lock:
+                launched = _session["process"] is not None
+            if launched:
+                Thread(
+                    target=_deferred_load_state, args=(load_slot, seq), daemon=True
+                ).start()
+            else:
+                log.warning("resume: launch failed — slot %d load not scheduled", load_slot)
     finally:
-        # Only the caller that claimed launch_in_progress (POST /launch) may
-        # release it — a dashboard relaunch clearing it unconditionally would
-        # wipe a concurrent /launch's claim and reopen the TOCTOU.
+        # Only the caller that claimed launch_in_progress may release it —
+        # clearing it unconditionally would wipe a concurrent claim and
+        # reopen the TOCTOU.
         if release_claim:
             with _session_lock:
                 _session["launch_in_progress"] = False
+
+
+def _claim_card_op() -> bool:
+    """Claim the memory-card slot for a whole-card replace.
+
+    Deliberately NOT launch_in_progress: a card op launches nothing, so
+    borrowing the launch claim made the monitor's crash relaunch skip and
+    never retry, leaving no emulator running at all. This flag blocks GAME
+    launches (which mount the card) while letting the gameless dashboard
+    recover — the dashboard never opens a memory card, and the replace is an
+    atomic staging swap, so a relaunch mid-hydrate sees either the old card
+    or the new one, never a partial.
+
+    Refuses when a game is running or a launch is in flight; those states end
+    with a mounted card.
+    """
+    with _session_lock:
+        if (
+            _session["rom_path"] is not None
+            or _session["launch_in_progress"]
+            or _session["card_op_in_progress"]
+        ):
+            return False
+        _session["card_op_in_progress"] = True
+        return True
+
+
+def _release_card_op() -> None:
+    with _session_lock:
+        _session["card_op_in_progress"] = False
+
+
+def _relaunch_dashboard():
+    """Dashboard relaunch that respects the launch claim. If a /launch is
+    already in flight, skip: that launch's kill+start sequence supersedes
+    the dashboard anyway, and interleaving the two corrupts both."""
+    if not _claim_launch():
+        log.info("Dashboard relaunch skipped — a launch is already in progress")
+        return
+    _launch_pcsx2(None, release_claim=True)
 
 
 def _sstate_snapshot() -> dict:
@@ -521,10 +642,17 @@ def _sstate_snapshot() -> dict:
     return snap
 
 
-def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
+def _matches_slot(p: Path, slot: int) -> bool:
+    """True when a state file's name targets `slot` (padded or bare suffix)."""
+    return p.name.endswith(f".{slot:02d}.p2s") or p.name.endswith(f".{slot}.p2s")
+
+
+def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = None) -> bool:
     """Poll SSTATE_DIR until a save state write completes or deadline is reached.
 
-    Detects both new files and overwrites of existing ones (by mtime change).
+    When `slot` is given, only files named for that slot count — otherwise an
+    unrelated .p2s write (autosave, user F1) would confirm a save that never
+    happened. Detects both new files and overwrites of existing ones (by mtime change).
     Once a target file is found, waits for its size to be stable for 0.5 s
     before returning — handles both direct writes and atomic rename patterns.
 
@@ -542,6 +670,8 @@ def _wait_for_sstate_write(before: dict, deadline: float) -> bool:
 
         if target is None:
             for p, (size, mtime) in after.items():
+                if slot is not None and not _matches_slot(p, slot):
+                    continue
                 prev = before.get(p)
                 if prev is None or prev[1] != mtime:
                     target = p
@@ -584,13 +714,16 @@ STATE_FILE_MAX_BYTES = 256 * 1024 * 1024
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
 
-def _wait_for_save_idle(deadline: float) -> None:
-    """Block until no save is in flight, or the deadline passes."""
+def _wait_for_save_idle(deadline: float) -> bool:
+    """Block until no save is in flight. Returns False when the deadline
+    passes with a save still running — callers must refuse to serve state
+    files in that case, not ship a half-written one."""
     while time.monotonic() < deadline:
         with _session_lock:
             if not _session["save_in_progress"]:
-                return
+                return True
         time.sleep(0.2)
+    return False
 
 
 def _newest_state_for_slot(slot: int) -> Path | None:
@@ -679,7 +812,7 @@ def _pine_save_state(slot: int) -> bool | None:
     # PCSX2 queues the save onto the VM thread and replies immediately, so
     # confirm the actual write the same way the xdotool path does.
     log.info("PINE: save state accepted (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
-    if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT):
+    if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, slot):
         return True
     log.warning("PINE: save accepted but no state file write within %.1fs (slot %d)", PINE_WAIT, slot)
     return False
@@ -711,20 +844,32 @@ def _pine_emu_status() -> int | None:
     return struct.unpack("<I", body[:4])[0]
 
 
-def _deferred_load_state(slot: int) -> None:
+def _deferred_load_state(slot: int, seq: int) -> None:
     """Resume-from-state: load `slot` once the freshly launched game's VM is up.
 
     Waits for the launch to finish swapping instances before trusting the
     status probe — probing earlier could see a still-running previous game
     and load the slot into the wrong VM. After the swap, only the new game
     VM reports running (a gameless relaunch reports shutdown).
+
+    `seq` is the launch_seq of the launch this load belongs to; if any other
+    launch lands during the (up to 90s) wait, the load is abandoned rather
+    than delivered into the wrong game's VM.
     """
     deadline = time.monotonic() + RESUME_LOAD_WAIT
     while time.monotonic() < deadline:
         with _session_lock:
             launching = _session["launch_in_progress"]
+            superseded = _session["launch_seq"] != seq
+        if superseded:
+            log.info("resume: launch superseded — slot %d load abandoned", slot)
+            return
         if not launching and _pine_emu_status() == 0:
             time.sleep(RESUME_LOAD_SETTLE)
+            with _session_lock:
+                if _session["launch_seq"] != seq:
+                    log.info("resume: launch superseded — slot %d load abandoned", slot)
+                    return
             ok = _load_state(slot)
             log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
             return
@@ -828,7 +973,8 @@ def _xdotool_cycle_to_slot(wid: str, slot: int) -> bool:
     for _ in range(cycles):
         try:
             subprocess.run(
-                xdo_cmd + ["key", "--window", wid, key], timeout=5, check=True
+                xdo_cmd + ["key", "--window", wid, key],
+                capture_output=True, text=True, timeout=5, check=True,
             )
         except subprocess.CalledProcessError as exc:
             log.error("xdotool: slot cycle keypress failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
@@ -882,7 +1028,10 @@ def _xdotool_save_state(slot: int) -> bool:
         + ["xdotool"]
     )
     try:
-        subprocess.run(xdo_cmd + ["key", "--window", wid, "F1"], timeout=5, check=True)
+        subprocess.run(
+            xdo_cmd + ["key", "--window", wid, "F1"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
     except subprocess.CalledProcessError as exc:
         log.error("xdotool: F1 send failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
         return False
@@ -898,7 +1047,7 @@ def _xdotool_save_state(slot: int) -> bool:
         wid, slot, PINE_WAIT,
     )
     deadline = time.monotonic() + PINE_WAIT
-    if not _wait_for_sstate_write(before, deadline):
+    if not _wait_for_sstate_write(before, deadline, slot):
         # Same contract as _pine_save_state: an unconfirmed write is a failed
         # save, so callers never report saved=true for a state that may not exist.
         log.warning("xdotool: save state write not confirmed within %.1fs (F1 was sent)", PINE_WAIT)
@@ -921,7 +1070,10 @@ def _xdotool_load_state(slot: int) -> bool:
         + ["xdotool"]
     )
     try:
-        subprocess.run(xdo_cmd + ["key", "--window", wid, "F3"], timeout=5, check=True)
+        subprocess.run(
+            xdo_cmd + ["key", "--window", wid, "F3"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
     except subprocess.CalledProcessError as exc:
         log.error("xdotool: F3 send failed (exit %d, stderr=%s)", exc.returncode, exc.stderr)
         return False
@@ -1015,6 +1167,15 @@ _SAVE_DATA_ROOTS = (
 # Archive members must live under one of these root-relative subtrees; PUT
 # rejects anything else so a crafted zip cannot reach configs or savestates.
 SAVE_SYNC_SUBTREES = ("memcards",)
+# A PS2 memory card is 8 MB and a folder card holds one game's saves per
+# subfolder, so 256 MB is far above anything real. It is a hard ceiling, not a
+# tunable: exceeding it fails the sync outright (GET 413 / PUT 413), it is NOT
+# read from the environment, and both the whole archive and the extracted size
+# are held in memory. If a card ever legitimately grows past this — a card pool
+# far larger than expected, or a future non-memcard subtree added to
+# SAVE_SYNC_SUBTREES — raising the number alone is not enough: the transfer has
+# to move to streaming/chunked I/O first, or the broker will OOM before it hits
+# the limit. Same reasoning applies to STATE_FILE_MAX_BYTES above.
 SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
 # Zip stores mtimes at 2 s DOS resolution; the slack keeps the newer-file
 # guard from skipping files over rounding alone.
@@ -1122,9 +1283,12 @@ def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | st
                 skipped += 1
                 continue
             data, mtime = result
+            # UTC, matched by calendar.timegm on extract — a TZ difference
+            # between the GET and PUT containers must not shift mtimes and
+            # silently break the newer-file guard.
             info = zipfile.ZipInfo(
                 p.relative_to(root).as_posix(),
-                date_time=time.localtime(mtime)[:6],
+                date_time=time.gmtime(mtime)[:6],
             )
             zf.writestr(info, data, zipfile.ZIP_DEFLATED)
             wrote += 1
@@ -1149,12 +1313,15 @@ def _mkdirs_owned(path: Path) -> None:
             pass
 
 
-def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
+def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
     """Restore a pulled save archive into the data dir.
 
-    Returns (written, skipped) on success, or an error string for a bad
-    archive. Existing files newer than their archive member are skipped so a
-    restore can never roll back saves made since the archive was taken."""
+    Returns (written, skipped, failed), or an error string for a bad archive.
+    Existing files newer than their archive member are skipped so a restore
+    can never roll back saves made since the archive was taken. A per-file
+    write failure doesn't abort the restore — remaining members still land,
+    the failure is counted, and the handler reports it; the mtime guard
+    makes a retry of the same archive idempotent."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
@@ -1173,10 +1340,10 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
             ):
                 return f"archive member outside save subtrees: {info.filename}"
 
-        written = skipped = 0
+        written = skipped = failed = 0
         for info in infos:
             target = root / PurePosixPath(info.filename)
-            mtime = time.mktime(info.date_time + (0, 0, -1))
+            mtime = calendar.timegm(info.date_time)
             try:
                 if (
                     target.exists()
@@ -1191,9 +1358,11 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
             except OSError as exc:
-                return f"could not write {info.filename}: {exc}"
+                log.warning("save-file: could not restore %s — %s", info.filename, exc)
+                failed += 1
+                continue
             written += 1
-    return (written, skipped)
+    return (written, skipped, failed)
 
 
 # ── Whole memory-card sync (per-user card model) ──────────────────────────────
@@ -1202,6 +1371,12 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
 # host-independent image, so a user's card can be hydrated onto any pooled
 # container. GET evacuates the whole card; PUT wipes Slot 1 and lays the card
 # back down. Only Slot 1 is ever touched — Slot 2 is never synced.
+
+
+# Serializes whole-card operations: os.getpid() is constant in this process,
+# so two concurrent PUTs would otherwise share staging/backup paths and
+# rmtree each other mid-write.
+_memcard_lock = Lock()
 
 
 def _memcards_dir() -> Path:
@@ -1410,19 +1585,23 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         # Block while a save is being written so the caller never receives a
         # half-written or stale file right after triggering a save.
-        _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT)
+        if not _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT):
+            self._send_json(503, {"error": "save still in progress; retry shortly"})
+            return
 
         state_path = _newest_state_for_slot(slot)
         if state_path is None:
             self._send_json(404, {"error": "no state file for slot", "slot": slot})
             return
         try:
+            # Size-check via stat before reading — never hold an oversized
+            # file in memory just to refuse it.
+            if state_path.stat().st_size > STATE_FILE_MAX_BYTES:
+                self._send_json(413, {"error": "state file exceeds size limit"})
+                return
             content = state_path.read_bytes()
         except OSError as exc:
             self._send_json(500, {"error": f"could not read state file: {exc}"})
-            return
-        if len(content) > STATE_FILE_MAX_BYTES:
-            self._send_json(413, {"error": "state file exceeds size limit"})
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -1486,16 +1665,37 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "archive too large"})
             return
         content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
         result = _extract_save_archive(content)
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
-        written, skipped = result
+        written, skipped, failed = result
+        if failed:
+            log.warning(
+                "save-file: restore incomplete — %d written, %d skipped, %d failed",
+                written, skipped, failed,
+            )
+            self._send_json(500, {
+                "error": "some archive members could not be written",
+                "written": written, "skipped": skipped, "failed": failed,
+            })
+            return
         log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
     def _get_memory_card(self):
-        result = _build_memory_card_archive()
+        # Same non-blocking policy as PUT: contention means a card operation
+        # is mid-flight, and the caller should retry rather than queue up.
+        if not _memcard_lock.acquire(blocking=False):
+            self._send_json(409, {"error": "memory card operation already in progress"})
+            return
+        try:
+            result = _build_memory_card_archive()
+        finally:
+            _memcard_lock.release()
         if isinstance(result, str):
             # e.g. slot 1 is a File card, not a Folder card.
             self._send_json(409, {"error": result})
@@ -1519,6 +1719,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.info("memory-card: served slot-1 card (%d bytes)", len(result))
 
     def _put_memory_card(self):
+        # PCSX2 holds the folder card open while a game VM is up; replacing
+        # it underneath the emulator corrupts the card. Hydration belongs
+        # before launch (or after exit), never mid-game. This early check is
+        # just a fast-fail before the (large) body read; the authoritative
+        # check runs under the launch claim below.
+        with _session_lock:
+            if _session["rom_path"] is not None or _session["launch_in_progress"]:
+                self._send_json(
+                    409, {"error": "cannot replace memory card while a game is running"}
+                )
+                return
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -1533,7 +1744,24 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if len(content) != length:
             self._send_json(400, {"error": "truncated request body"})
             return
-        result = _replace_memory_card(content)
+        # Claim for the whole replace. Re-checks "no game running" atomically,
+        # closing the TOCTOU against a /launch that lands during the body read
+        # above — POST /launch refuses while this claim is held.
+        if not _claim_card_op():
+            self._send_json(
+                409, {"error": "cannot replace memory card while a game is running or launching"}
+            )
+            return
+        try:
+            if not _memcard_lock.acquire(blocking=False):
+                self._send_json(409, {"error": "memory card operation already in progress"})
+                return
+            try:
+                result = _replace_memory_card(content)
+            finally:
+                _memcard_lock.release()
+        finally:
+            _release_card_op()
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
@@ -1617,11 +1845,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     and _session["process"].poll() is None
                 )
                 snap = dict(_session) if active else {}
+                abandoned = _session["relaunch_abandoned"]
             self._send_json(200, {
                 "active":     active,
                 "rom_path":   snap.get("rom_path")   if active else None,
                 "rom_name":   snap.get("rom_name")   if active else None,
                 "started_at": snap.get("started_at") if active else None,
+                # True once the crash-loop limiter gave up: nothing is running
+                # and nothing will restart it without an explicit POST /launch.
+                # Distinguishes a dead container from an idle dashboard.
+                "relaunch_abandoned": abandoned,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -1671,7 +1904,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
                 # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
-                Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
+                Thread(target=_relaunch_dashboard, daemon=True).start()
             else:
                 # Clear visible session state synchronously so that callers
                 # polling /status immediately after this response observe
@@ -1691,7 +1924,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     if not ok:
                         log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", s)
                     # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
-                    _launch_pcsx2(None)
+                    _relaunch_dashboard()
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 self._send_json(200, {"status": "queued", "slot": slot})
             return
@@ -1829,15 +2062,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if _session["launch_in_progress"]:
                 self._send_json(409, {"error": "launch already in progress"})
                 return
+            # A game launch mounts the memory card; starting one mid-hydrate
+            # would race the card swap.
+            if _session["card_op_in_progress"]:
+                self._send_json(409, {"error": "memory card operation in progress"})
+                return
             _session["launch_in_progress"] = True
 
         Thread(
-            target=_launch_pcsx2, args=(str(rom_path), True), daemon=True
+            target=_launch_pcsx2, args=(str(rom_path), True, load_slot), daemon=True
         ).start()
-        if load_slot is not None:
-            Thread(
-                target=_deferred_load_state, args=(load_slot,), daemon=True
-            ).start()
         self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
 
     def do_DELETE(self):
@@ -1848,7 +2082,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        Thread(target=_launch_pcsx2, args=(None,), daemon=True).start()
+        # Same claim as POST /launch — a soft reset interleaved with a live
+        # launch would run two kill+start sequences against one session.
+        if not _claim_launch():
+            self._send_json(409, {"error": "launch already in progress"})
+            return
+        Thread(target=_launch_pcsx2, args=(None, True), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
 
@@ -1864,14 +2103,15 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
 
     # Wait briefly for any in-flight save to finish. The /save-and-exit handler
     # holds save_in_progress for the duration of the save request + write poll.
-    deadline = time.monotonic() + max(PINE_WAIT, 5.0)
+    save_wait = max(PINE_WAIT, 5.0)
+    deadline = time.monotonic() + save_wait
     while time.monotonic() < deadline:
         with _session_lock:
             if not _session["save_in_progress"]:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing PCSX2 anyway", PINE_WAIT)
+        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing PCSX2 anyway", save_wait)
 
     _kill_pcsx2()
     log.info("Shutdown complete")
