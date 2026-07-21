@@ -1,6 +1,6 @@
 # pcsx2-romm-integration
 
-A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that integrates [PCSX2](https://pcsx2.net/) with [RomM](https://github.com/rommapp/romm) — launching PS2 games on demand from RomM's web UI and streaming the output back via Selkies.
+A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) for [PCSX2](https://pcsx2.net/) that connects to [RomM](https://github.com/rommapp/romm). Pick a game from the RomM web UI and the mod launches it in PCSX2, streaming the session back via Selkies.
 
 ---
 
@@ -10,7 +10,7 @@ This mod installs a small HTTP broker inside the [linuxserver/pcsx2](https://doc
 
 1. Exposes an API on port 8000 so RomM can request game launches
 2. Manages the PCSX2 process lifecycle (start, stop, game switching, dashboard mode)
-3. Saves game state via PCSX2's PINE IPC before exit
+3. Saves game state by sending an F-key to the PCSX2 window (via xdotool) before exit
 4. Patches Selkies and PCSX2 at init time for reliable controller and socket handling
 5. Supervises itself via s6-overlay (auto-restarts on crash)
 
@@ -56,6 +56,32 @@ docker compose up -d --force-recreate pcsx2
 
 ---
 
+## Memory Card Setup (required for save sync)
+
+**The PCSX2 memory card must be set to `Folder` type, not `File`.** This is the
+standard for this mod, and in-game save sync depends on it.
+
+A `File` card is a single monolithic 8 MB image holding every game's saves at
+once, so it cannot be synced per game or isolated per user. A `Folder` card
+stores each game in its own directory keyed by the game's serial ID (for
+example `BASLUS-20267DOTHACK/`), which is what lets the broker sync and hydrate
+one game's save without touching any other.
+
+Set it in PCSX2 under **Settings -> Memory Cards**: create a new card of type
+`Folder` and assign it to **Slot 1** (Slot 1 is the only slot synced). Confirm
+`inis/PCSX2.ini` shows the folder card on `Slot1_Filename`:
+
+```ini
+[MemoryCards]
+Slot1_Enable = true
+Slot1_Filename = my-folder-card.ps2   # this is a directory on disk, not a file
+```
+
+> Save **states** (`.p2s` snapshots, synced via `/state-file`) do not depend on
+> the memory card type. This requirement is only for in-game memory-card saves.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -63,11 +89,16 @@ docker compose up -d --force-recreate pcsx2
 | `BROKER_SECRET` | *(none)* | Shared secret for authentication. Sent as the `X-Broker-Secret` header. If unset, all requests are accepted — not recommended on a shared network. |
 | `BROKER_PORT` | `8000` | Port the broker HTTP server listens on. |
 | `ROM_ROOT` | `/romm/library` | Root path inside the container where ROMs are mounted. Requests with a `rom_path` outside this directory are rejected. |
-| `PINE_SOCKET` | `/config/.XDG/pcsx2.sock` | Path to PCSX2's PINE IPC socket. Auto-discovered if not present at this path. |
-| `PINE_TIMEOUT` | `2.0` | Timeout (seconds) for connecting to and sending via the PINE socket. |
-| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the PINE command. Polling stops early once the write is detected. Increase for slow disks or large games. |
+| `PINE_WAIT` | `20.0` | Maximum seconds to poll for save state write completion after sending the save keypress. Polling stops early once the write is detected. Increase for slow disks or large games. (Name kept for backwards compatibility — the broker now confirms writes for the xdotool save path, not PINE.) |
 | `SAVE_SLOT` | `10` | Default save state slot (1–10) for `/save-and-exit` when no `slot` is specified. Slot 10 is recommended as an auto-save slot, leaving 1–9 free for manual use. |
-| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Currently informational — used by a planned RomM export/import feature. |
+| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes save state files. Served and written by the `/state-file` endpoints for RomM's save-state sync. |
+| `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` blocks waiting for an in-flight save to finish before serving the slot file. |
+| `RESUME_LOAD_WAIT` | `90.0` | Max seconds a `load_slot` launch waits for the new game VM to reach running state before giving up on the deferred state load. |
+| `RESUME_LOAD_SETTLE` | `3.0` | Seconds to let the game settle after the VM reports running, before the deferred `load_slot` state load fires. |
+| `SAVE_DATA_ROOT` | `/config/.config/PCSX2` | Override for the PCSX2 data dir the `/save-file` and `/memory-card` endpoints operate on. Only the `memcards/` subtree under it is synced. |
+| `BROKER_INITIAL_SLOT` | `1` | Fallback save state slot the broker assumes PCSX2 starts on when `SaveStateSlot` can't be read from `PCSX2.ini`. Only affects xdotool slot cycling. |
+| `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | File that captures pcsx2-qt's stdout/stderr (renderer, Vulkan, Qt errors). Appended across launches. |
+| `BROKER_LOG_LEVEL` | `INFO` | Broker log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
 ---
 
@@ -114,11 +145,14 @@ Returns the current session.
   "active": true,
   "rom_path": "/romm/library/ps2/game.chd",
   "rom_name": "game",
-  "started_at": "2026-01-01T00:00:00Z"
+  "started_at": "2026-01-01T00:00:00Z",
+  "relaunch_abandoned": false
 }
 ```
 
 Returns `{"active": false, ...}` when no game is running.
+
+`relaunch_abandoned` is `true` once PCSX2 has exited within 5 s three times in a row and the broker has stopped restarting it — nothing is running and nothing will recover it without an explicit `POST /launch`. Monitor this to tell a container that is idle at the dashboard (`active: false`, `relaunch_abandoned: false`) from one that has given up (`active: false`, `relaunch_abandoned: true`); the latter needs intervention, usually a GPU/renderer failure visible in `PCSX2_LOG_PATH`.
 
 ---
 
@@ -127,12 +161,13 @@ Returns `{"active": false, ...}` when no game is running.
 Kills any running game and launches a new ROM. Returns immediately; launch runs in a background thread.
 
 ```json
-{ "rom_path": "/romm/library/ps2/game.chd", "rom_name": "Game Title" }
+{ "rom_path": "/romm/library/ps2/game.chd", "rom_name": "Game Title", "load_slot": 3 }
 ```
 
 - `rom_path` must exist and be under `ROM_ROOT`
-- Returns `409` if a save is in progress
-- Returns `400` if `rom_path` is missing or outside `ROM_ROOT`
+- `load_slot` (optional, 1–10) — resume-from-state: once the game VM reports running (checked via PINE `EMU_STATUS`, up to `RESUME_LOAD_WAIT`, plus a `RESUME_LOAD_SETTLE` grace), the broker loads that state slot. Push the state file via `PUT /state-file` before launching.
+- Returns `409` if a save is in progress, a launch is already in progress, or a `/memory-card` replace is in flight
+- Returns `400` if `rom_path` is missing or outside `ROM_ROOT`, or `load_slot` is not an integer 1–10
 - Returns `422` if `rom_path` does not exist
 
 ```json
@@ -144,6 +179,8 @@ Kills any running game and launches a new ROM. Returns immediately; launch runs 
 ### `DELETE /launch`
 
 Stops the current game and returns PCSX2 to dashboard mode. Runs in background.
+
+- Returns `409` if a launch is already in progress
 
 ```json
 { "status": "resetting" }
@@ -179,6 +216,132 @@ Save states are written to `SSTATE_DIR` as `{SERIAL} ({CRC}).{slot:02d}.p2s`.
 
 - Returns `409` if no game is running or if a save is already in progress
 - Returns `400` if `slot` is not an integer 0–10
+
+---
+
+### `POST /save-state`
+
+Saves the current game to a slot without exiting. The keypress goes to the PCSX2 window via xdotool and the save runs in the background, so a `200` means the keystroke was sent — not that the write finished. Watch `/status` (`save_in_progress`) to confirm.
+
+```json
+{ "slot": 1 }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `slot` | `1` | Save state slot (1–10) |
+
+```json
+{ "status": "saving", "slot": 1 }
+```
+
+- Returns `409` if no game is running or a save is already in progress
+- Returns `400` if `slot` is not an integer 1–10
+
+---
+
+### `POST /load-state`
+
+Loads a save state into the running game. This one blocks until the keystroke is dispatched.
+
+```json
+{ "slot": 1 }
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `slot` | `1` | Save state slot (1–10) |
+
+```json
+{ "status": "ok", "loaded": true, "slot": 1 }
+```
+
+- Returns `409` if no game is running
+- Returns `400` if `slot` is not an integer 1–10
+- Returns `503` if the PCSX2 window can't be reached (the broker itself is fine)
+
+---
+
+### `GET /state-file?slot=N`
+
+Serves the newest `.p2s` state file for the slot as raw bytes, for RomM's centralized save-state sync. If a save is in flight the response blocks until the write completes (up to `STATE_GET_WAIT`, default 30 s), so a GET fired right after `/save-state` always carries the finished file.
+
+| Query param | Default | Description |
+|---|---|---|
+| `slot` | `0` | Save state slot (1–10); `0` resolves to `SAVE_SLOT` |
+
+- Response body is `application/octet-stream`; the emulator's own filename is echoed in the `X-State-Filename` header
+- Returns `404` if no state file exists for the slot
+- Returns `400` if `slot` is not an integer 0–10
+- Returns `503` if a save is still in flight after `STATE_GET_WAIT` — retry rather than accept a half-written file
+- Returns `413` if the state file exceeds 256 MB
+
+---
+
+### `PUT /state-file?filename=NAME`
+
+Writes a state file into the sstates directory, used by RomM to hydrate a freshly claimed container with the user's stored states. `NAME` is the filename a previous GET returned — written back verbatim so PCSX2 recognises the slot.
+
+- Body is the raw file content (`Content-Length` required, max 256 MB)
+- `NAME` must be a bare `.p2s` basename; path components are rejected
+- The write is atomic (temp file + rename) and the file is chowned to `abc` so PCSX2 can overwrite the slot later
+
+```json
+{ "status": "ok", "filename": "SLUS-12345 (ABCD1234).03.p2s" }
+```
+
+---
+
+### `GET /save-file`
+
+Zips every in-game save (memory-card file under `memcards/`) modified since the last game launch, for RomM's end-of-session save pull. The baseline survives game exit, so the pull can happen after `/save-and-exit`.
+
+- Response body is `application/zip`; a suggested name is echoed in `X-Save-Filename`
+- Files still being written are skipped; their count is reported in `X-Save-Skipped-Unstable`
+- Returns `404` if no game has been launched, or nothing changed since the last launch
+- Returns `413` if the changed set exceeds 256 MB
+- Returns `503` if every changed file was mid-write — retry shortly
+
+---
+
+### `PUT /save-file`
+
+Restores a previously pulled save archive into the data dir, used to hydrate a container before launch. Files on disk newer than their archive member are skipped (last-write-wins), so a restore can never roll back saves made since the archive was taken.
+
+- Body is the raw zip (`Content-Length` required, max 256 MB)
+- Archive members must live under `memcards/`; anything else is rejected
+- Returns `400` for a bad/truncated archive or a member outside the allowed subtree
+- Returns `500` if some members could not be written — the response carries `written`/`skipped`/`failed` counts, and retrying the same archive is safe (idempotent)
+
+```json
+{ "status": "ok", "written": 3, "skipped": 1 }
+```
+
+---
+
+### `GET /memory-card`
+
+Serves the **entire** Slot-1 folder memory card (superblock plus every game folder) as one zip, member paths relative to the card root so the image is host- and card-name-independent. This is the per-user card evacuation for pooled containers; Slot 2 is never touched.
+
+- Response is `application/zip` with `X-Memory-Card-Slot: 1`
+- Returns `404` with header `X-Memory-Card: absent` if no folder card exists in slot 1 — the header distinguishes "genuinely empty" from a missing endpoint, which must not be treated as safe-to-wipe
+- Returns `409` if slot 1 is a File (`.ps2`) card — the whole-card sync requires a Folder card — or if another card operation is in progress
+
+---
+
+### `PUT /memory-card`
+
+Wipes the Slot-1 folder card and lays down the pulled card image (no per-file merge — full replace is the isolation guarantee for pooled containers). Extraction goes to a staging dir swapped atomically over the live card, so a mid-way failure never leaves a half-wiped card.
+
+- Body is the raw zip (`Content-Length` required, max 256 MB)
+- Refused while a game is running or a launch is in flight — PCSX2 holds the card open and replacing it mid-game corrupts it. Hydrate before launch or after exit. `POST /launch` is refused for the duration, so a launch cannot slip in mid-replace.
+- Dashboard crash recovery is *not* blocked during a replace: the gameless dashboard never opens a memory card, and the swap is atomic, so a relaunch mid-hydrate sees either the old card or the new one
+- Returns `409` if a game is running, a launch is in progress, or another card operation is in progress
+- Returns `400` for a bad/truncated archive, a member escaping the card dir, or when no Slot-1 card is configured
+
+```json
+{ "status": "ok", "written": 42 }
+```
 
 ---
 
@@ -254,11 +417,27 @@ Expected on game launch:
 
 Expected on save-and-exit:
 ```
-14:25:45 [broker] INFO PINE: save command sent (slot 0) — waiting 3.0s for write
+14:25:45 [broker] INFO xdotool: F1 sent to window 0x3a00007 (slot 10) — waiting for write (max 20.0s)
 14:25:48 [broker] INFO Stopping PCSX2 (PID 123)...
 14:25:49 [broker] INFO Launching PCSX2 (rom=dashboard)
 14:25:49 [broker] INFO PCSX2 launched (PID 456)
 ```
+
+---
+
+## Development
+
+The broker's logic is covered by a stdlib `unittest` suite — no pytest, no dependencies, nothing to install. Run it from the repo root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+`tests/` is excluded from the image via `.dockerignore`, so it never ships in a build.
+
+The suite covers the save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching and parsing, ROM path validation, and the session lifecycle state machine (crash-loop limiter, launch/card-op claims, deferred `load_slot` generation checks).
+
+Anything needing a real X display, PINE socket, or `pcsx2-qt` process is deliberately out of scope — those paths are only provable on a running container.
 
 ---
 
@@ -287,9 +466,9 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 | Save state on exit | ✅ Done | `POST /save-and-exit` — xdotool F-key to PCSX2 window, slot 10 default |
 | Return to dashboard on exit | ✅ Done | Automatic after any exit path |
 | Volume control | ✅ Done | `POST /volume` and `POST /mute` via `pactl` |
-| Manual save state (no exit) | 🔜 Planned | `POST /save-state` with slot selection |
-| Manual load state | 🔜 Planned | `POST /load-state` with slot selection |
-| RomM save state export/import | 🔜 Planned | Sync `.p2s` files from `SSTATE_DIR` to/from RomM library |
+| Manual save state (no exit) | ✅ Done | `POST /save-state` with slot selection |
+| Manual load state | ✅ Done | `POST /load-state` with slot selection |
+| RomM save state export/import | ✅ Done | `GET`/`PUT /state-file` — RomM pulls saves into the library and hydrates slots on claim |
 
 ---
 
