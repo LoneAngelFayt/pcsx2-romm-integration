@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   # The job id IS the status-check context named by the branch ruleset.
-  # Do not add a `name:` key here - it would rename the reported check and
+  # Do not add a `name:` key here: it would rename the reported check and
   # the required-check rule would block every PR waiting on "ci-test".
   ci-test:
     runs-on: ubuntu-latest
@@ -34,9 +34,17 @@ jobs:
         run: ruff check .
 
       - name: Run unit tests (pytest)
+        env:
+          # Flip to 'true' once this repo has a suite. Without it a deleted or
+          # unstaged tests/ directory silently downgrades ci-test to a lint-only
+          # gate and still reports green, which is the failure mode this guards.
+          EXPECT_TESTS: 'true'
         run: |
           if ls tests/test_*.py >/dev/null 2>&1; then
             pytest tests/ -q
+          elif [ "$EXPECT_TESTS" = "true" ]; then
+            echo "::error::EXPECT_TESTS is set but no tests/test_*.py were found"
+            exit 1
           else
-            echo "::notice::no tests/ in this repo yet - ci-test is a lint-only gate"
+            echo "::notice::no tests/ in this repo yet, ci-test is a lint-only gate"
           fi
