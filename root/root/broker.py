@@ -237,15 +237,15 @@ def _patch_ini():
         # doesn't exist at all we create it so PCSX2 picks the value up.
         missing = [(sec, key, val) for (sec, key), val in patches.items() if (sec, key) not in applied]
         if missing:
-            present_sections = {l.strip()[1:-1] for l in new_lines if l.strip().startswith("[") and l.strip().endswith("]")}
+            present_sections = {line.strip()[1:-1] for line in new_lines if line.strip().startswith("[") and line.strip().endswith("]")}
             for sec, _key, val in missing:
                 if sec in present_sections:
                     # Insert immediately after the section header.
                     out: list[str] = []
                     inserted = False
-                    for l in new_lines:
-                        out.append(l)
-                        if not inserted and l.strip() == f"[{sec}]":
+                    for line in new_lines:
+                        out.append(line)
+                        if not inserted and line.strip() == f"[{sec}]":
                             out.append(val)
                             inserted = True
                     new_lines = out
