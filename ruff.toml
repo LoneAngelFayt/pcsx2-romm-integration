@@ -1,0 +1,12 @@
+# Lint baseline shared by every RomM integration repo. The ruff version is
+# pinned in .github/workflows/ci.yml so a new ruff release cannot turn CI red
+# on code nobody touched; bump both together.
+line-length = 100
+target-version = "py311"
+
+[lint]
+# E,F,W is clean across all five brokers today. I/UP/B are the natural next
+# step but need a one-off cleanup pass first.
+select = ["E", "F", "W"]
+# Long ini-patch and URL lines are everywhere in the brokers; not worth a reflow.
+ignore = ["E501"]
