@@ -165,10 +165,11 @@ Kills any running game and launches a new ROM. Returns immediately; launch runs 
 ```
 
 - `rom_path` must exist and be under `ROM_ROOT`
+- `rom_path` may be a **directory**, for libraries laid out one game per folder (`roms/ps2/Jak 3/Jak 3.iso`). RomM addresses such a game by its folder, so the broker looks inside for the disc image: the folder itself first, then one level down for per-disc subfolders. Candidates are ranked by format (`.chd`, `.iso`, `.cso`, `.zso`, `.gz`, `.mdf`, `.dump`, `.bin`, `.elf`) and then by name, so a multi-disc set boots disc 1. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen. The resolved file is what `/status` and the response body report.
 - `load_slot` (optional, 1–10) — resume-from-state: once the game VM reports running (checked via PINE `EMU_STATUS`, up to `RESUME_LOAD_WAIT`, plus a `RESUME_LOAD_SETTLE` grace), the broker loads that state slot. Push the state file via `PUT /state-file` before launching.
 - Returns `409` if a save is in progress, a launch is already in progress, or a `/memory-card` replace is in flight
 - Returns `400` if `rom_path` is missing or outside `ROM_ROOT`, or `load_slot` is not an integer 1–10
-- Returns `422` if `rom_path` does not exist
+- Returns `422` if `rom_path` does not exist, or if it is a directory with no bootable file inside. The second case reports the accepted extensions in an `extensions` field, so callers never need their own copy of the list
 
 ```json
 { "status": "launching", "rom_path": "/romm/library/ps2/game.chd" }
