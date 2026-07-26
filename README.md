@@ -176,7 +176,12 @@ Kills any running game and launches a new ROM. Returns immediately; launch runs 
 ```
 
 - `rom_path` must exist and be under `ROM_ROOT`. `rom_name` (as shown in `/status`) is not read from the request; it is always derived from `rom_path`'s filename stem.
-- `rom_path` may be a **directory**, for libraries laid out one game per folder (`roms/ps2/Jak 3/Jak 3.iso`). RomM addresses such a game by its folder, so the broker looks inside for the disc image: the folder itself first, then one level down for per-disc subfolders. Candidates are ranked by format (`.chd`, `.iso`, `.cso`, `.zso`, `.gz`, `.mdf`, `.dump`, `.bin`, `.elf`) and then by name, so a multi-disc set boots disc 1. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen. The resolved file is what `/status` and the response body report.
+- `rom_path` may be a **directory**, for libraries laid out one game per folder (`roms/ps2/Jak 3/Jak 3.iso`). RomM addresses such a game by its folder, so the broker looks inside for the disc image, in the folder itself and one level down for the per-disc subfolders some sets use. Everything found across both levels is ranked together, in this order:
+  1. **Disc number**, read from the file or folder name (`Disc 1`, `(Disc 2)`, `CD1`), so a multi-disc set starts on disc 1. The number is compared as a number, which keeps disc 2 ahead of disc 10. A name that mentions no disc counts as disc 1.
+  2. **Format**: `.chd`, `.iso`, `.cso`, `.zso`, `.gz`, `.mdf`, `.dump`, `.bin`, `.elf`. This decides between two candidates for the same disc, so a `.chd` beats the raw `.bin` beside it.
+  3. **Depth**, so the image sitting in the game folder wins over one buried in an extras subfolder.
+
+  Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen. The resolved file is what `/status` and the response body report. Note that resolution only chooses where a session *starts*: there is no disc swapping, so a game that asks for its next disc cannot be given one.
 - `load_slot` (optional, 1–10) resumes from a save state. Once the game VM reports running (checked via PINE `EMU_STATUS`, up to `RESUME_LOAD_WAIT`, plus a `RESUME_LOAD_SETTLE` grace period), the broker loads that slot. Push the state file with `PUT /state-file` before launching.
 - Returns `409` if a save is in progress, a launch is already in progress, or a `/memory-card` replace is in flight
 - Returns `400` if `rom_path` is missing or outside `ROM_ROOT`, or `load_slot` is not an integer 1–10

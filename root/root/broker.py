@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket as _socket
@@ -202,11 +203,28 @@ ROM_EXTENSIONS = (
     ".chd", ".iso", ".cso", ".zso", ".gz", ".mdf", ".dump", ".bin", ".elf",
 )
 
-# Where to look for the disc image below a game folder. The folder itself
-# first, then one level down for the per-disc subfolders some sets use
-# (Game/Disc 1/game.iso). Nothing deeper: a launch must not pay for a full
-# walk of a large set, and anything further down is extras, not the game.
+# Where to look for the disc image below a game folder: the folder itself, then
+# one level down for the per-disc subfolders some sets use (Game/Disc 1/game.iso).
+# Nothing deeper: a launch must not pay for a full walk of a large set, and
+# anything further down is extras, not the game.
 _ROM_SEARCH_GLOBS = ("*", "*/*")
+
+# "Disc 1", "(Disc 2)", "CD1", "Disk_3" in a folder or file name. The leading
+# boundary keeps it off words that merely end in the letters, so "abcd2.iso" is
+# not read as disc 2.
+_DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
+
+
+def _disc_number(rel: Path) -> int:
+    """Disc number named anywhere in `rel`, or 1 when nothing names one.
+
+    Unmarked files count as disc 1 so that a single-disc game ranks level with
+    the first disc of a set, and so a false positive can only ever mean "first".
+    """
+    match = _DISC_RE.search(str(rel))
+    if match is None:
+        return 1
+    return max(1, int(match.group(1)))
 
 
 def _resolve_rom_file(path: Path) -> Path | None:
@@ -223,23 +241,35 @@ def _resolve_rom_file(path: Path) -> Path | None:
         return path
     if not path.is_dir():
         return None
+    # Every level is collected before anything is ranked. Taking the first level
+    # that merely yields a match would let an extras file with a bootable
+    # extension (manual.bin) beat the real disc image one level down.
+    candidates: list[Path] = []
     for pattern in _ROM_SEARCH_GLOBS:
         try:
-            found = _pick_rom_file(path.glob(pattern))
+            candidates.extend(path.glob(pattern))
         except OSError:
             # Libraries are routinely NFS mounts, so a stalled or vanished
             # share surfaces here as an OSError mid-walk. Report it as "no
             # bootable file" rather than 500-ing the launch.
             return None
-        if found is not None:
-            return found
-    return None
+    return _pick_rom_file(candidates, path)
 
 
-def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
-    """Best bootable file among `candidates`, by format preference then name
-    (which puts 'Disc 1' ahead of 'Disc 2' for a multi-disc set)."""
-    ranked: list[tuple[int, str, Path]] = []
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Best bootable file among `candidates`, all of them somewhere under `base`.
+
+    Ranked by disc number, then format, then depth, then name:
+
+      * disc first, so a set starts on disc 1 whatever format the later discs
+        are in. Comparing the numbers also keeps 'Disc 2' ahead of 'Disc 10',
+        which sorting the names as text does not.
+      * format next, because among candidates for the same disc it decides
+        which to boot: a .chd beats the raw .bin beside it.
+      * then depth, so the image sitting in the game folder wins over one
+        buried in an extras subfolder.
+    """
+    ranked: list[tuple[int, int, int, str, Path]] = []
     for p in candidates:
         if p.name.startswith("."):
             continue
@@ -252,14 +282,18 @@ def _pick_rom_file(candidates: Iterable[Path]) -> Path | None:
             # A symlink in the folder must not walk the launch out of
             # ROM_ROOT: _validate_rom_path only vetted the folder itself.
             real = p.resolve()
-        except OSError:
+            rel = p.relative_to(base)
+        except (OSError, ValueError):
             continue
         if not real.is_relative_to(ROM_ROOT):
             continue
-        ranked.append((ROM_EXTENSIONS.index(ext), p.name.lower(), real))
+        ranked.append(
+            (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts),
+             p.name.lower(), real)
+        )
     if not ranked:
         return None
-    return min(ranked)[2]
+    return min(ranked)[4]
 
 
 def _patch_ini():

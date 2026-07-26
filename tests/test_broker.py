@@ -512,6 +512,36 @@ class RomFileResolutionTests(_RomRootMixin, unittest.TestCase):
         self._rom("ps2/Game/extras/bonus.iso")
         self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), top)
 
+    def test_stray_track_at_the_top_does_not_beat_a_nested_disc_image(self):
+        """A .bin loose in the game folder must not win just for being shallow:
+        sets ship extras with bootable extensions, and the real discs are one
+        level down in per-disc subfolders."""
+        disc1 = self._rom("ps2/FFX/Disc 1/FFX (Disc 1).chd")
+        self._rom("ps2/FFX/Disc 2/FFX (Disc 2).chd")
+        self._rom("ps2/FFX/manual.bin")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_disc_one_wins_even_when_disc_two_is_a_better_format(self):
+        """Format preference decides which of two candidates for the *same*
+        disc to boot. It must not decide which disc to start on."""
+        disc1 = self._rom("ps2/FFX/Disc 1/FFX.iso")
+        self._rom("ps2/FFX/Disc 2/FFX.chd")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_disc_two_beats_disc_ten(self):
+        """Disc order is numeric. Sorting the names as text puts 'Disc 10'
+        ahead of 'Disc 2', which starts a long set on the wrong disc."""
+        disc2 = self._rom("ps2/Game/Game (Disc 2).iso")
+        self._rom("ps2/Game/Game (Disc 10).iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), disc2)
+
+    def test_unmarked_image_still_wins_over_a_nested_marked_one(self):
+        """Nothing names a disc for the top-level image, so it must not lose to
+        a deeper file that happens to carry a disc marker."""
+        top = self._rom("ps2/Game/Game.iso")
+        self._rom("ps2/Game/extras/Bonus (Disc 1).iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), top)
+
     def test_does_not_descend_past_the_second_level(self):
         self._rom("ps2/Game/a/b/deep.iso")
         self.assertIsNone(broker._resolve_rom_file(self.tmp / "ps2" / "Game"))
