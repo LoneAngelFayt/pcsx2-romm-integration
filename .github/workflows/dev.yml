@@ -6,7 +6,11 @@ on:
       - main
 
 jobs:
+  ci-test:
+    uses: ./.github/workflows/ci.yml
+
   docker:
+    needs: ci-test
     runs-on: ubuntu-latest
     permissions:
       packages: write

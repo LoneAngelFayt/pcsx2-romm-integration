@@ -1,0 +1,50 @@
+name: CI Test Suite
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The job id IS the status-check context named by the branch ruleset.
+  # Do not add a `name:` key here: it would rename the reported check and
+  # the required-check rule would block every PR waiting on "ci-test".
+  ci-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # No `cache: pip` on purpose: setup-python hard-fails when no
+          # requirements.txt/pyproject.toml exists, and these repos have none.
+
+      - name: Install tooling
+        run: pip install pytest==8.3.4 ruff==0.15.22
+
+      - name: Run linter (ruff)
+        run: ruff check .
+
+      - name: Run unit tests (pytest)
+        env:
+          # Flip to 'true' once this repo has a suite. Without it a deleted or
+          # unstaged tests/ directory silently downgrades ci-test to a lint-only
+          # gate and still reports green, which is the failure mode this guards.
+          EXPECT_TESTS: 'true'
+        run: |
+          if ls tests/test_*.py >/dev/null 2>&1; then
+            pytest tests/ -q
+          elif [ "$EXPECT_TESTS" = "true" ]; then
+            echo "::error::EXPECT_TESTS is set but no tests/test_*.py were found"
+            exit 1
+          else
+            echo "::notice::no tests/ in this repo yet, ci-test is a lint-only gate"
+          fi
