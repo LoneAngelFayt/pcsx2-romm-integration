@@ -438,7 +438,8 @@ class DeferredLoadTests(unittest.TestCase):
         load.assert_not_called()
 
 
-class RomPathValidationTests(unittest.TestCase):
+class _RomRootMixin:
+    """Gives each test an isolated ROM_ROOT to build library layouts in."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
@@ -446,6 +447,15 @@ class RomPathValidationTests(unittest.TestCase):
         patcher = mock.patch.object(broker, "ROM_ROOT", self.tmp)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def _rom(self, rel, data=b"disc"):
+        p = self.tmp / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return p
+
+
+class RomPathValidationTests(_RomRootMixin, unittest.TestCase):
 
     def test_accepts_path_under_rom_root(self):
         p = self.tmp / "ps2" / "game.chd"
@@ -458,6 +468,124 @@ class RomPathValidationTests(unittest.TestCase):
         self.assertIsNone(
             broker._validate_rom_path(str(self.tmp / ".." / "escape.chd"))
         )
+
+
+class RomFileResolutionTests(_RomRootMixin, unittest.TestCase):
+    """Issue #11: RomM addresses a folder-organized game by its folder, so
+    /launch receives a directory pcsx2-qt cannot boot."""
+
+    def test_plain_file_passes_through(self):
+        iso = self._rom("ps2/game.iso")
+        self.assertEqual(broker._resolve_rom_file(iso), iso)
+
+    def test_game_folder_resolves_to_the_disc_image_inside(self):
+        iso = self._rom("ps2/Jak 3/Jak 3.iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Jak 3"), iso)
+
+    def test_folder_without_a_bootable_file_returns_none(self):
+        self._rom("ps2/Jak 3/cover.jpg")
+        self._rom("ps2/Jak 3/notes.txt")
+        self.assertIsNone(broker._resolve_rom_file(self.tmp / "ps2" / "Jak 3"))
+
+    def test_multi_disc_folder_picks_disc_one(self):
+        disc1 = self._rom("ps2/FFX/FFX (Disc 1).iso")
+        self._rom("ps2/FFX/FFX (Disc 2).iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_better_format_wins_over_a_raw_track(self):
+        chd = self._rom("ps2/Game/Game.chd")
+        self._rom("ps2/Game/Game (Track 1).bin")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), chd)
+
+    def test_cue_sheet_is_not_chosen_over_its_image(self):
+        binf = self._rom("ps2/Game/Game.bin")
+        self._rom("ps2/Game/Game.cue")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), binf)
+
+    def test_finds_image_in_a_per_disc_subfolder(self):
+        disc1 = self._rom("ps2/FFX/Disc 1/FFX.iso")
+        self._rom("ps2/FFX/Disc 2/FFX.iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_top_level_image_wins_over_a_nested_one(self):
+        top = self._rom("ps2/Game/Game.iso")
+        self._rom("ps2/Game/extras/bonus.iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), top)
+
+    def test_does_not_descend_past_the_second_level(self):
+        self._rom("ps2/Game/a/b/deep.iso")
+        self.assertIsNone(broker._resolve_rom_file(self.tmp / "ps2" / "Game"))
+
+    def test_hidden_files_are_ignored(self):
+        self._rom("ps2/Game/._Game.iso")
+        self.assertIsNone(broker._resolve_rom_file(self.tmp / "ps2" / "Game"))
+
+    def test_symlink_escaping_rom_root_is_refused(self):
+        outside = Path(tempfile.mkdtemp()).resolve() / "escape.iso"
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(outside.parent, ignore_errors=True)
+        )
+        outside.write_bytes(b"disc")
+        folder = self.tmp / "ps2" / "Game"
+        folder.mkdir(parents=True)
+        (folder / "link.iso").symlink_to(outside)
+        self.assertIsNone(broker._resolve_rom_file(folder))
+
+    def test_missing_path_returns_none(self):
+        self.assertIsNone(broker._resolve_rom_file(self.tmp / "ps2" / "nope"))
+
+
+class _FakeHandler(broker.BrokerHandler):
+    """Drives do_POST without a socket: the request line and body are given
+    up front and the response is captured instead of written."""
+
+    def __init__(self, path, body):
+        self.path = path
+        self._body = body
+        self.sent = None
+
+    def _check_secret(self):
+        return True
+
+    def _read_body(self):
+        return self._body
+
+    def _send_json(self, code, body, headers=None):
+        self.sent = (code, body)
+
+
+class LaunchEndpointTests(_RomRootMixin, unittest.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        _reset_session()
+        self.addCleanup(_reset_session)
+
+    def _post_launch(self, rom_path):
+        handler = _FakeHandler("/launch", {"rom_path": str(rom_path)})
+        with mock.patch.object(broker, "Thread") as thread:
+            handler.do_POST()
+        self.thread = thread
+        return handler.sent
+
+    def test_launching_a_game_folder_boots_the_file_inside(self):
+        iso = self._rom("ps2/Jak 3/Jak 3.iso")
+        code, body = self._post_launch(self.tmp / "ps2" / "Jak 3")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["rom_path"], str(iso))
+        self.assertEqual(self.thread.call_args.kwargs["args"][0], str(iso))
+
+    def test_folder_without_a_bootable_file_is_reported_distinctly(self):
+        self._rom("ps2/Jak 3/cover.jpg")
+        code, body = self._post_launch(self.tmp / "ps2" / "Jak 3")
+        self.assertEqual(code, 422)
+        self.assertIn("no bootable ROM file", body["error"])
+        self.assertFalse(broker._session["launch_in_progress"])
+
+    def test_missing_path_still_reports_that_it_does_not_exist(self):
+        code, body = self._post_launch(self.tmp / "ps2" / "nope")
+        self.assertEqual(code, 422)
+        self.assertEqual(body["error"], "rom_path does not exist")
 
 
 if __name__ == "__main__":
