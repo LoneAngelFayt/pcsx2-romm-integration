@@ -101,6 +101,57 @@ Slot1_Filename = my-folder-card.ps2   # this is a directory on disk, not a file
 | `BROKER_LOG_LEVEL` | `INFO` | Broker log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Note: the xdotool window-search success logs (`xdotool: found window ...`) are DEBUG-level; set `BROKER_LOG_LEVEL=DEBUG` to see them. |
 | `PUID` / `PGID` | `1000` / `1000` | Standard LinuxServer container UID/GID. The broker also uses them to `chown` the files it writes on PCSX2's behalf (`pcsx2-qt.log`, pulled save-state files, restored save and memory-card files) so pcsx2-qt, which runs as `abc`, can read and overwrite them later. |
 
+Any variable named `NVIDIA_*`, `VK_*`, `MESA_*`, `LIBGL_*`, `GALLIUM_*`, `RADV_*`, `AMD_*`, `DRI_*`, `LIBVA_*`, `VDPAU_*`, `__GLX_*`, `__NV_*`, `__EGL_*` or `__VK_*`, plus `XDG_DATA_DIRS`, is forwarded from the container environment to `pcsx2-qt`. See [GPU Acceleration](#gpu-acceleration).
+
+---
+
+## GPU Acceleration
+
+The broker starts `pcsx2-qt` as the `abc` user via `sudo`, and sudo's `env_reset` discards the container environment. Only variables the broker names explicitly reach the emulator — the vendor prefixes listed above are forwarded for you, so renderer settings in your compose file take effect.
+
+On startup the broker logs which ones it found:
+
+```
+[broker] INFO Forwarding GPU environment to pcsx2-qt: NVIDIA_DRIVER_CAPABILITIES, VK_DRIVER_FILES
+```
+
+If your variables aren't in that line, they never reached the container — check the compose file, not the broker.
+
+### NVIDIA: renderer falls back to llvmpipe
+
+`llvmpipe` is Mesa's software rasterizer. Its Vulkan counterpart, lavapipe, also reports its device name as `llvmpipe`, so the same word shows up for both APIs. Seeing it means the NVIDIA driver was not used, but there are two very different reasons that happens and they need different fixes. Find out which one you have before changing anything:
+
+```bash
+docker exec -u abc <container> vulkaninfo --summary
+```
+
+**If NVIDIA does not appear in the device list**, the driver was never visible to the loader. This is a container runtime problem, not an emulator one. The NVIDIA Container Toolkit only injects the graphics libraries and `/usr/share/vulkan/icd.d/nvidia_icd.json` when the container asks for the `graphics` capability; the default `utility,compute` is enough for CUDA and nothing else.
+
+```yaml
+services:
+  pcsx2:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all   # must include 'graphics'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+Confirm the ICD actually landed: `docker exec <container> ls /usr/share/vulkan/icd.d/` should show `nvidia_icd.json`. If only `lvp_icd.*.json` (lavapipe) is there, the capability is still wrong and no emulator-side setting will help.
+
+**If NVIDIA does appear but the emulator still falls back**, discovery is fine and the failure is later, at surface or swapchain creation. The tell is that the renderer fails *after* correctly naming your GPU, for example PCSX2 reporting "Failed to create render device" while OpenGL still works, or a `could not create swapchain` error. Things worth checking, roughly in order:
+
+- Whether the container has a primary DRM node and the NVIDIA device nodes, not just a render node: `docker exec <container> ls -l /dev/dri/ /dev/nvidia*`. A `renderD*` node alone cannot present.
+- `nvidia-drm.modeset=1` on the host, which Xwayland needs for NVIDIA presentation.
+- On multi-GPU hosts, whether the node the compositor picked is the NVIDIA one. The base image logs its choice at startup (`[Wayland] AUTO_GPU enabled. Selected: ...`).
+
+Renderer errors from the emulator itself land in `PCSX2_LOG_PATH` (`/config/pcsx2-qt.log`), and `VK_LOADER_DEBUG=all` set on the container is now forwarded to the emulator, so loader diagnostics reach that log too.
+
 ---
 
 ## RomM Configuration
@@ -530,6 +581,11 @@ Available versions: [Packages page](https://github.com/LoneAngelFayt/pcsx2-romm-
 - If the window isn't found, confirm `xdotool` is installed: `docker exec pcsx2 which xdotool`
 - Increase `PINE_WAIT` (default 20s) if saves are slow: `PINE_WAIT=30.0`
 - Save files land at `SSTATE_DIR` (`/config/.config/PCSX2/sstates` by default): `docker exec pcsx2 ls /config/.config/PCSX2/sstates`
+
+**Rendering falls back to llvmpipe / GPU environment variables have no effect**
+- Check the broker's startup line: `docker logs pcsx2 | grep "GPU environment"`. It lists exactly which variables reached the emulator
+- Then run `docker exec -u abc pcsx2 vulkaninfo --summary` to find out which of the two causes you have. If NVIDIA is absent, the ICD was never injected; if NVIDIA is listed and the renderer still falls back, the failure is at surface creation, not discovery
+- The two need different fixes. See [GPU Acceleration](#gpu-acceleration)
 
 **PCSX2 crashes immediately after game launch**
 - Check emulog for GPU or BIOS errors
