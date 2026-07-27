@@ -407,6 +407,58 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(broker._session["is_managed"])
 
 
+class GpuEnvTests(unittest.TestCase):
+    """sudo's env_reset wipes the container environment, so anything the
+    operator sets for the GPU only reaches pcsx2-qt if the broker names it
+    explicitly on the `env` command line."""
+
+    def test_forwards_vendor_graphics_variables(self):
+        with mock.patch.dict(os.environ, {
+            "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/nvidia_icd.json",
+            "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+            "NVIDIA_DRIVER_CAPABILITIES": "all",
+            "MESA_VK_DEVICE_SELECT": "10de:0000",
+        }, clear=False):
+            env = broker._gpu_env()
+        self.assertEqual(
+            env["VK_DRIVER_FILES"], "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        )
+        self.assertEqual(env["__GLX_VENDOR_LIBRARY_NAME"], "nvidia")
+        self.assertEqual(env["NVIDIA_DRIVER_CAPABILITIES"], "all")
+        self.assertEqual(env["MESA_VK_DEVICE_SELECT"], "10de:0000")
+
+    def test_ignores_unrelated_and_empty_variables(self):
+        with mock.patch.dict(os.environ, {
+            "BROKER_SECRET": "hunter2",
+            "PATH": "/usr/bin",
+            "VK_DRIVER_FILES": "",
+        }, clear=False):
+            env = broker._gpu_env()
+        self.assertNotIn("BROKER_SECRET", env)
+        self.assertNotIn("PATH", env)
+        self.assertNotIn("VK_DRIVER_FILES", env)
+
+    def test_computed_entries_win_over_inherited_ones(self):
+        """DISPLAY and LD_PRELOAD are derived from live container state; a
+        stale inherited value must never shadow them."""
+        self.assertEqual(broker.ENV["DISPLAY"], broker._detect_display())
+        self.assertEqual(broker.ENV["LD_PRELOAD"], broker._LD_PRELOAD)
+
+    def test_launch_puts_gpu_env_on_the_sudo_command_line(self):
+        _reset_session()
+        self.addCleanup(_reset_session)
+        log_path = Path(tempfile.mkdtemp()) / "pcsx2-qt.log"
+        env = dict(broker.ENV, VK_DRIVER_FILES="/icd/nvidia_icd.json")
+        with mock.patch.object(broker, "ENV", env), \
+             mock.patch.object(broker, "PCSX2_LOG_PATH", log_path), \
+             mock.patch.object(broker.subprocess, "Popen") as popen, \
+             mock.patch.object(broker, "_read_initial_save_slot", return_value=1), \
+             mock.patch.object(broker, "Thread") as thread:
+            thread.return_value.start.return_value = None
+            broker._launch_pcsx2_internal(None)
+        self.assertIn("VK_DRIVER_FILES=/icd/nvidia_icd.json", popen.call_args[0][0])
+
+
 class DeferredLoadTests(unittest.TestCase):
 
     def setUp(self):
@@ -510,6 +562,36 @@ class RomFileResolutionTests(_RomRootMixin, unittest.TestCase):
     def test_top_level_image_wins_over_a_nested_one(self):
         top = self._rom("ps2/Game/Game.iso")
         self._rom("ps2/Game/extras/bonus.iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), top)
+
+    def test_stray_track_at_the_top_does_not_beat_a_nested_disc_image(self):
+        """A .bin loose in the game folder must not win just for being shallow:
+        sets ship extras with bootable extensions, and the real discs are one
+        level down in per-disc subfolders."""
+        disc1 = self._rom("ps2/FFX/Disc 1/FFX (Disc 1).chd")
+        self._rom("ps2/FFX/Disc 2/FFX (Disc 2).chd")
+        self._rom("ps2/FFX/manual.bin")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_disc_one_wins_even_when_disc_two_is_a_better_format(self):
+        """Format preference decides which of two candidates for the *same*
+        disc to boot. It must not decide which disc to start on."""
+        disc1 = self._rom("ps2/FFX/Disc 1/FFX.iso")
+        self._rom("ps2/FFX/Disc 2/FFX.chd")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "FFX"), disc1)
+
+    def test_disc_two_beats_disc_ten(self):
+        """Disc order is numeric. Sorting the names as text puts 'Disc 10'
+        ahead of 'Disc 2', which starts a long set on the wrong disc."""
+        disc2 = self._rom("ps2/Game/Game (Disc 2).iso")
+        self._rom("ps2/Game/Game (Disc 10).iso")
+        self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), disc2)
+
+    def test_unmarked_image_still_wins_over_a_nested_marked_one(self):
+        """Nothing names a disc for the top-level image, so it must not lose to
+        a deeper file that happens to carry a disc marker."""
+        top = self._rom("ps2/Game/Game.iso")
+        self._rom("ps2/Game/extras/Bonus (Disc 1).iso")
         self.assertEqual(broker._resolve_rom_file(self.tmp / "ps2" / "Game"), top)
 
     def test_does_not_descend_past_the_second_level(self):
