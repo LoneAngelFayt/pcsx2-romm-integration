@@ -141,7 +141,7 @@ def _gpu_env() -> dict[str, str]:
 
 
 ENV = {
-    # Inherited GPU vars come first so the computed entries below always win 
+    # Inherited GPU vars come first so the computed entries below always win
     # DISPLAY and LD_PRELOAD are derived from live container state and must not
     # be shadowed by a stale value from the container environment.
     **_gpu_env(),
@@ -802,7 +802,7 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
             else:
                 log.warning("resume: launch failed  slot %d load not scheduled", load_slot)
     finally:
-        # Only the caller that claimed launch_in_progress may release it 
+        # Only the caller that claimed launch_in_progress may release it
         # clearing it unconditionally would wipe a concurrent claim and
         # reopen the TOCTOU.
         if release_claim:
@@ -1731,7 +1731,7 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
                 try:
                     os.replace(backup, path)
                 except OSError:
-                    # The backup is now the only surviving copy of the card 
+                    # The backup is now the only surviving copy of the card
                     # leave it on disk for manual recovery instead of deleting it.
                     log.error(
                         "memory-card: could not restore card to %s  old card preserved at %s",
