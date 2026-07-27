@@ -670,5 +670,111 @@ class LaunchEndpointTests(_RomRootMixin, unittest.TestCase):
         self.assertEqual(body["error"], "rom_path does not exist")
 
 
+class StreamTokenTests(unittest.TestCase):
+    def setUp(self):
+        with broker._session_lock:
+            broker._session["stream_token"] = None
+
+    def test_issue_returns_nonempty_and_stores(self):
+        tok = broker._issue_stream_token()
+        self.assertTrue(tok)
+        self.assertEqual(broker._session["stream_token"], tok)
+
+    def test_check_true_for_issued_token(self):
+        tok = broker._issue_stream_token()
+        self.assertTrue(broker._check_stream_token(tok))
+
+    def test_check_false_for_wrong_token(self):
+        broker._issue_stream_token()
+        self.assertFalse(broker._check_stream_token("nope"))
+
+    def test_check_false_when_no_token_set(self):
+        self.assertFalse(broker._check_stream_token("anything"))
+        self.assertFalse(broker._check_stream_token(""))
+
+    def test_clear_invalidates(self):
+        tok = broker._issue_stream_token()
+        broker._clear_stream_token()
+        self.assertIsNone(broker._session["stream_token"])
+        self.assertFalse(broker._check_stream_token(tok))
+
+    def test_reissue_replaces_previous_token(self):
+        first = broker._issue_stream_token()
+        second = broker._issue_stream_token()
+        self.assertNotEqual(first, second)
+        self.assertFalse(broker._check_stream_token(first))
+        self.assertTrue(broker._check_stream_token(second))
+
+
+class StreamProxyHelperTests(unittest.TestCase):
+    def test_extract_token_from_query(self):
+        self.assertEqual(
+            broker._extract_stream_token("stream_token=abc&x=1", None), "abc"
+        )
+
+    def test_extract_token_from_cookie(self):
+        self.assertEqual(
+            broker._extract_stream_token("", "stream_sid=abc; other=1"), "abc"
+        )
+
+    def test_query_beats_cookie(self):
+        self.assertEqual(
+            broker._extract_stream_token("stream_token=q", "stream_sid=c"), "q"
+        )
+
+    def test_extract_none_when_absent(self):
+        self.assertIsNone(broker._extract_stream_token("y=2", "foo=bar"))
+        self.assertIsNone(broker._extract_stream_token("", None))
+
+    def test_cookie_value_has_required_attributes(self):
+        v = broker._stream_cookie_value("abc")
+        self.assertEqual(
+            v,
+            "stream_sid=abc; HttpOnly; Secure; SameSite=None; Partitioned; Path=/",
+        )
+
+
+class VerifyStreamDecisionTests(unittest.TestCase):
+    """The nginx auth_request decision: 200 admits, 403 rejects, and a query
+    bootstrap hands back the stream_sid Set-Cookie."""
+
+    def setUp(self):
+        with broker._session_lock:
+            broker._session["stream_token"] = "good"
+
+    def test_no_token_is_403(self):
+        status, cookie = broker._verify_stream_decision("/", None)
+        self.assertEqual(status, 403)
+        self.assertIsNone(cookie)
+
+    def test_valid_query_token_admits_and_sets_cookie(self):
+        status, cookie = broker._verify_stream_decision(
+            "/?stream_token=good", None
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            cookie,
+            "stream_sid=good; HttpOnly; Secure; SameSite=None; Partitioned; Path=/",
+        )
+
+    def test_valid_cookie_admits_without_set_cookie(self):
+        status, cookie = broker._verify_stream_decision(
+            "/", "stream_sid=good; other=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(cookie)
+
+    def test_wrong_query_token_is_403(self):
+        status, cookie = broker._verify_stream_decision(
+            "/?stream_token=bad", None
+        )
+        self.assertEqual(status, 403)
+        self.assertIsNone(cookie)
+
+    def test_wrong_cookie_is_403(self):
+        status, _ = broker._verify_stream_decision("/", "stream_sid=bad")
+        self.assertEqual(status, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -109,3 +109,50 @@ if [ -f "$INPUT_HANDLER" ]; then
 else
     echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
 fi
+
+# Gate the browser-facing stream with nginx auth_request. The 3001 SSL vhost is
+# the host RomM loads in the iframe; without this, anyone who learns the address
+# gets an interactive desktop with the ROM library mounted, since RomM's auth
+# never sits on this socket. auth_request sends every 3001 request to the
+# broker's /verify, which checks the session-bound stream token RomM appends to
+# the iframe URL and, on the first (query-token) hit, hands back a stream_sid
+# cookie that carries every later asset and the WebSocket upgrade. Anchored on
+# ssl_certificate_key, which appears only in the 3001 server block, so the plain
+# 3000 vhost is untouched. The broker exempts /verify from its shared secret
+# because nginx cannot forward that secret and the stream token is the credential.
+NGINX_SITE="/etc/nginx/sites-available/default"
+if [ -f "$NGINX_SITE" ]; then
+    if grep -q "RomM stream gate" "$NGINX_SITE"; then
+        echo "[broker-mod] nginx stream gate already applied."
+    else
+        awk '
+          { print }
+          /ssl_certificate_key/ && !injected {
+            print "  # ── RomM stream gate (pcsx2-broker-mod) ──"
+            print "  auth_request /_stream_auth;"
+            print "  auth_request_set $stream_set_cookie $upstream_http_set_cookie;"
+            print "  add_header Set-Cookie $stream_set_cookie;"
+            print "  location = /_stream_auth {"
+            print "    internal;"
+            print "    auth_request off;"
+            print "    proxy_pass http://127.0.0.1:8000/verify;"
+            print "    proxy_pass_request_body off;"
+            print "    proxy_set_header Content-Length \"\";"
+            print "    proxy_set_header X-Original-URI $request_uri;"
+            print "  }"
+            injected = 1
+          }
+        ' "$NGINX_SITE" > "$NGINX_SITE.tmp" && mv "$NGINX_SITE.tmp" "$NGINX_SITE"
+        if grep -q "RomM stream gate" "$NGINX_SITE"; then
+            echo "[broker-mod] Applied nginx stream gate to 3001 vhost."
+            if ! nginx -t 2>/dev/null; then
+                echo "[broker-mod] WARNING: nginx -t failed now (ssl cert may not exist yet at init); nginx revalidates at start."
+            fi
+        else
+            rm -f "$NGINX_SITE.tmp"
+            echo "[broker-mod] ERROR: nginx stream gate not applied (ssl_certificate_key anchor missing; base image may have changed)."
+        fi
+    fi
+else
+    echo "[broker-mod] WARNING: nginx site config not found at $NGINX_SITE"
+fi

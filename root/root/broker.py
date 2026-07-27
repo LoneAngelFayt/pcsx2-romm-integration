@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket as _socket
@@ -18,6 +19,7 @@ import sys
 import time
 import zipfile
 from collections.abc import Iterable
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
@@ -228,9 +230,80 @@ _session: dict = {
     # GET /save-file only ships files modified at or after this point; it
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline":    None,
+    # Random per-session token gating the stream proxy on port 3001. Minted on
+    # /launch, swapped for a cookie by the browser, cleared on release.
+    "stream_token":     None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _issue_stream_token() -> str:
+    """Mint a fresh stream token and bind it to the current session."""
+    token = secrets.token_urlsafe(32)
+    with _session_lock:
+        _session["stream_token"] = token
+    return token
+
+
+def _check_stream_token(token: str) -> bool:
+    """Constant-time check of token against the live session token."""
+    if not token:
+        return False
+    with _session_lock:
+        current = _session["stream_token"]
+    if not current:
+        return False
+    return hmac.compare_digest(token, current)
+
+
+def _clear_stream_token() -> None:
+    """Drop the stream token so the gate rejects everything until next launch."""
+    with _session_lock:
+        _session["stream_token"] = None
+
+
+def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
+    """Read the stream token: query stream_token wins, else the stream_sid cookie."""
+    qs = parse_qs(query)
+    if qs.get("stream_token"):
+        return qs["stream_token"][0]
+    if cookie_header:
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+        if "stream_sid" in jar:
+            return jar["stream_sid"].value
+    return None
+
+
+def _stream_cookie_value(token: str) -> str:
+    """Set-Cookie value for the stream session. SameSite=None, Secure, and
+    Partitioned are required: the iframe is cross-site to RomM, so the cookie
+    is third-party and browsers partition or drop it without these attributes."""
+    return (
+        f"stream_sid={token}; HttpOnly; Secure; "
+        "SameSite=None; Partitioned; Path=/"
+    )
+
+
+def _verify_stream_decision(
+    original_uri: str, cookie_header: str | None
+) -> tuple[int, str | None]:
+    """Decide an nginx auth_request subrequest for the stream gate.
+
+    Returns (status, set_cookie). 200 admits the request, 403 rejects it.
+    When the token arrives in the query (the first iframe load), the caller
+    gets a Set-Cookie so later requests carry stream_sid and the token drops
+    out of the URL. A cookie-authed request that is already good gets no
+    Set-Cookie back, so nginx does not rewrite it.
+    """
+    query = urlparse(original_uri).query
+    token = _extract_stream_token(query, cookie_header)
+    if not _check_stream_token(token or ""):
+        return 403, None
+    if "stream_token" in parse_qs(query):
+        return 200, _stream_cookie_value(token)
+    return 200, None
+
 
 def _validate_rom_path(raw: str) -> Path | None:
     """Resolve raw to an absolute path and confirm it lives under ROM_ROOT."""
@@ -1687,6 +1760,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
             SECRET,
         )
 
+    def _verify_stream(self) -> None:
+        # nginx auth_request subrequest for the stream gate. nginx forwards the
+        # real request URI (carrying the stream_token query on first load) via
+        # X-Original-URI and the browser Cookie header; the broker returns 200
+        # to admit or 403 to reject, and a Set-Cookie on the query bootstrap.
+        status, set_cookie = _verify_stream_decision(
+            self.headers.get("X-Original-URI", ""),
+            self.headers.get("Cookie"),
+        )
+        headers = {"Set-Cookie": set_cookie} if set_cookie else None
+        self._send_json(status, {"ok": status == 200}, headers)
+
     def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
         self.send_response(code)
@@ -1979,8 +2064,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif path == "/verify":
+            self._verify_stream()
         elif not self._check_secret():
-            # /health stays open for container healthchecks; all other GETs
+            # /health and /verify stay open; /health for container healthchecks,
+            # /verify because the stream token is itself the credential (nginx
+            # auth_request cannot forward the broker secret). All other GETs
             # require the shared secret, matching POST/DELETE.
             self._send_json(403, {"error": "forbidden"})
         elif path == "/state-file":
@@ -2006,6 +2095,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # and nothing will restart it without an explicit POST /launch.
                 # Distinguishes a dead container from an idle dashboard.
                 "relaunch_abandoned": abandoned,
+                "stream_token": snap.get("stream_token") if active else None,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -2054,6 +2144,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if not ok:
                     log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+                # Save-and-exit releases the session, so the stream token must
+                # die with it: a discovered host is otherwise still usable.
+                _clear_stream_token()
                 # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
                 Thread(target=_relaunch_dashboard, daemon=True).start()
             else:
@@ -2065,6 +2158,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _session["rom_path"] = None
                     _session["rom_name"] = "Dashboard"
                     _session["started_at"] = None
+                # Save-and-exit releases the session, so the stream token must
+                # die with it: a discovered host is otherwise still usable.
+                _clear_stream_token()
 
                 def _bg(s):
                     try:
@@ -2234,10 +2330,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             _session["launch_in_progress"] = True
 
+        stream_token = _issue_stream_token()
         Thread(
             target=_launch_pcsx2, args=(str(rom_path), True, load_slot), daemon=True
         ).start()
-        self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+        self._send_json(200, {
+            "status": "launching",
+            "rom_path": str(rom_path),
+            "stream_token": stream_token,
+        })
 
     def do_DELETE(self):
         if not self._check_secret():
@@ -2252,6 +2353,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not _claim_launch():
             self._send_json(409, {"error": "launch already in progress"})
             return
+        # DELETE /launch releases the session, so the stream token must die
+        # with it: a discovered host is otherwise still usable.
+        _clear_stream_token()
         Thread(target=_launch_pcsx2, args=(None, True), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
