@@ -167,6 +167,19 @@ SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"
 RESUME_LOAD_WAIT   = float(os.environ.get("RESUME_LOAD_WAIT",   "90.0"))
 RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "3.0"))
 
+# Stream token lifetime. The TTL is idle time, not absolute: every admitted
+# request slides it forward, so it only fires on a session nobody is watching.
+# Without it a token minted by /launch stays valid until an explicit release,
+# and a container that loses its RomM side (crash, network partition, a user
+# who just closes the tab) leaves the gate open indefinitely.
+STREAM_TOKEN_TTL   = float(os.environ.get("STREAM_TOKEN_TTL",   "43200.0"))
+# How long the superseded token keeps working after a re-issue. Relaunching
+# into an already-open tab means the browser is still replaying the old
+# stream_sid cookie while RomM navigates the iframe to the new URL; without
+# this window every one of those in-flight requests 403s and the stream client
+# reports a dropped connection and retries in a loop.
+STREAM_TOKEN_GRACE = float(os.environ.get("STREAM_TOKEN_GRACE", "120.0"))
+
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [broker] %(levelname)s %(message)s",
@@ -231,35 +244,86 @@ _session: dict = {
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline":    None,
     # Random per-session token gating the stream proxy on port 3001. Minted on
-    # /launch, swapped for a cookie by the browser, cleared on release.
-    "stream_token":     None,
+    # /launch, swapped for a cookie by the browser, cleared on release. The
+    # expiry is a monotonic deadline refreshed on every admitted request; the
+    # prev_* pair holds the token a re-issue replaced, valid for a short grace
+    # window so an already-open tab is not cut off mid-relaunch.
+    "stream_token":         None,
+    "stream_expires":       0.0,
+    "stream_prev_token":    None,
+    "stream_prev_expires":  0.0,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _issue_stream_token() -> str:
-    """Mint a fresh stream token and bind it to the current session."""
+    """Mint a fresh stream token and bind it to the current session.
+
+    The token being replaced is demoted rather than dropped: it stays usable
+    for STREAM_TOKEN_GRACE seconds so requests already in flight from an open
+    tab still land. See STREAM_TOKEN_GRACE for why that matters.
+    """
     token = secrets.token_urlsafe(32)
+    now = time.monotonic()
     with _session_lock:
+        previous = _session["stream_token"]
+        if previous:
+            _session["stream_prev_token"] = previous
+            _session["stream_prev_expires"] = now + STREAM_TOKEN_GRACE
         _session["stream_token"] = token
+        _session["stream_expires"] = now + STREAM_TOKEN_TTL
     return token
 
 
-def _check_stream_token(token: str) -> bool:
-    """Constant-time check of token against the live session token."""
+def _check_stream_token(token: str) -> str | None:
+    """Judge token against the live session token, then the superseded one.
+
+    Returns None when the token is good, otherwise a short reason for the log.
+    A hit on the live token slides its expiry forward: the TTL exists to close
+    an abandoned session, not to interrupt someone who is still playing.
+    """
     if not token:
-        return False
+        return "no stream token in the request"
+    now = time.monotonic()
     with _session_lock:
         current = _session["stream_token"]
-    if not current:
-        return False
-    return hmac.compare_digest(token, current)
+        if not current:
+            return "no stream session is open"
+        if hmac.compare_digest(token, current):
+            if now >= _session["stream_expires"]:
+                return "stream token expired after %.0fs idle" % STREAM_TOKEN_TTL
+            _session["stream_expires"] = now + STREAM_TOKEN_TTL
+            return None
+        previous = _session["stream_prev_token"]
+        if previous and hmac.compare_digest(token, previous):
+            if now < _session["stream_prev_expires"]:
+                return None
+            _session["stream_prev_token"] = None
+            _session["stream_prev_expires"] = 0.0
+            return "stream token superseded by a newer launch"
+    return "stream token does not match the open session"
 
 
 def _clear_stream_token() -> None:
     """Drop the stream token so the gate rejects everything until next launch."""
     with _session_lock:
         _session["stream_token"] = None
+        _session["stream_expires"] = 0.0
+        _session["stream_prev_token"] = None
+        _session["stream_prev_expires"] = 0.0
+
+
+def _live_stream_token() -> str | None:
+    """The session token if it is still inside its TTL, else None.
+
+    /status hands this to RomM so a reconnecting client can re-attach without
+    a relaunch. An expired token would only send it into the 403 loop the TTL
+    is there to end, so it is reported as absent.
+    """
+    with _session_lock:
+        if _session["stream_token"] and time.monotonic() < _session["stream_expires"]:
+            return _session["stream_token"]
+    return None
 
 
 def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
@@ -287,10 +351,11 @@ def _stream_cookie_value(token: str) -> str:
 
 def _verify_stream_decision(
     original_uri: str, cookie_header: str | None
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str | None]:
     """Decide an nginx auth_request subrequest for the stream gate.
 
-    Returns (status, set_cookie). 200 admits the request, 403 rejects it.
+    Returns (status, set_cookie, reason). 200 admits the request, 403 rejects
+    it and carries the reason so the refusal is legible in the container log.
     When the token arrives in the query (the first iframe load), the caller
     gets a Set-Cookie so later requests carry stream_sid and the token drops
     out of the URL. A cookie-authed request that is already good gets no
@@ -298,11 +363,16 @@ def _verify_stream_decision(
     """
     query = urlparse(original_uri).query
     token = _extract_stream_token(query, cookie_header)
-    if not _check_stream_token(token or ""):
-        return 403, None
+    reason = _check_stream_token(token or "")
+    if reason:
+        return 403, None, reason
     if "stream_token" in parse_qs(query):
-        return 200, _stream_cookie_value(token)
-    return 200, None
+        # Re-cookie on the query bootstrap, and also when the query token is
+        # the current one but the cookie still holds the superseded token:
+        # the browser must be moved onto the new value before the grace
+        # window closes, or the tab drops out the moment it does.
+        return 200, _stream_cookie_value(token), None
+    return 200, None, None
 
 
 def _validate_rom_path(raw: str) -> Path | None:
@@ -1760,14 +1830,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # real request URI (carrying the stream_token query on first load) via
         # X-Original-URI and the browser Cookie header; the broker returns 200
         # to admit or 403 to reject, and a Set-Cookie on the query bootstrap.
-        status, set_cookie = _verify_stream_decision(
+        status, set_cookie, reason = _verify_stream_decision(
             self.headers.get("X-Original-URI", ""),
             self.headers.get("Cookie"),
         )
         headers = {"Set-Cookie": set_cookie} if set_cookie else None
         body = {"ok": status == 200}
         if status != 200:
-            body["error"] = "stream token missing, expired, or already claimed"
+            body["error"] = reason or "stream request rejected"
         self._send_json(status, body, headers)
 
     def _log_error_response(self, code: int, body: dict) -> None:
@@ -2156,7 +2226,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # and nothing will restart it without an explicit POST /launch.
                 # Distinguishes a dead container from an idle dashboard.
                 "relaunch_abandoned": abandoned,
-                "stream_token": snap.get("stream_token") if active else None,
+                "stream_token": _live_stream_token() if active else None,
             })
         else:
             self._send_json(404, {"error": "not found"})

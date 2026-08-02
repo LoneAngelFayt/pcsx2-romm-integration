@@ -122,6 +122,8 @@ Save states don't care about any of this. The requirement is only for memory-car
 | `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | Captures pcsx2-qt stdout and stderr. Renderer and Vulkan failures show up here. Appended across launches. |
 | `BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. The xdotool window-found messages are DEBUG. |
 | `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for PCSX2, which runs as `abc` and has to overwrite them later. |
+| `STREAM_TOKEN_TTL` | `43200.0` | Idle seconds before a stream token stops working. Every admitted request slides it forward, so it only fires on a session nobody is watching. Stops an abandoned session leaving the stream gate open forever. |
+| `STREAM_TOKEN_GRACE` | `120.0` | How long the previous token keeps working after a relaunch mints a new one, so an already-open tab is not cut off mid-navigation. |
 
 ## API
 
@@ -226,6 +228,8 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 **RomM shows no play button.** Confirm `streaming.enabled: true`, confirm the platform slug matches, restart RomM after config changes, and check what RomM thinks it has: `curl http://romm:5000/api/streaming/config`.
 
+**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: either the mod's init never patched nginx (`docker logs pcsx2 | grep broker-mod`), or your reverse proxy is reaching the ungated plain-HTTP vhost on port 3000 instead of the SSL vhost on 3001. Point it at 3001 and do not publish 3000: the gate is the only thing standing between the ROM library and anyone who finds the address.
+
 ## Development
 
 The broker is one stdlib Python file with a stdlib `unittest` suite. Nothing to install, which is the point: the container has no pip, so the broker cannot grow a dependency without breaking the image.
@@ -237,6 +241,8 @@ python3 -m unittest discover -s tests -v
 CI runs the same tests under pytest, plus `ruff check .` against the shared [ruff.toml](ruff.toml). `tests/` is excluded from the image by `.dockerignore` and never ships.
 
 The suite covers what can be tested without a running emulator: save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching, ROM path resolution, and the session state machine (crash-loop limiter, launch and card-op claims, deferred `load_slot` generation checks). Anything needing a real X display, PINE socket, or pcsx2-qt process is out of scope on purpose, because it is only provable on a live container.
+
+**Init ordering matters more than it looks.** The mod ships two s6 oneshots. `init-pcsx2-config` rewrites files that base-image services read exactly once at startup (selkies' `input_handler.py`, the nginx site config, labwc's autostart), so `init-services` is made to depend on it and the whole service stack waits. Drop that edge and the patches still land on disk while changing nothing about the processes already running, which fails silently: the log says "Applied nginx stream gate" and the live nginx has no gate. Keep that script fast and offline. `init-pcsx2-deps` holds the slow networked work (apt, `patches.zip`) and only `svc-broker` waits for it, so a GitHub timeout cannot stall the stream.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/) and releases are cut automatically on merge to `main`: `fix:` bumps the patch, `feat:` the minor, `feat!:` the major.
 

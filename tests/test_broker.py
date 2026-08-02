@@ -686,38 +686,88 @@ class LaunchEndpointTests(_RomRootMixin, unittest.TestCase):
 
 class StreamTokenTests(unittest.TestCase):
     def setUp(self):
-        with broker._session_lock:
-            broker._session["stream_token"] = None
+        broker._clear_stream_token()
 
     def test_issue_returns_nonempty_and_stores(self):
         tok = broker._issue_stream_token()
         self.assertTrue(tok)
         self.assertEqual(broker._session["stream_token"], tok)
 
-    def test_check_true_for_issued_token(self):
+    def test_check_accepts_issued_token(self):
         tok = broker._issue_stream_token()
-        self.assertTrue(broker._check_stream_token(tok))
+        self.assertIsNone(broker._check_stream_token(tok))
 
-    def test_check_false_for_wrong_token(self):
+    def test_check_rejects_wrong_token(self):
         broker._issue_stream_token()
-        self.assertFalse(broker._check_stream_token("nope"))
+        self.assertIn("does not match", broker._check_stream_token("nope"))
 
-    def test_check_false_when_no_token_set(self):
-        self.assertFalse(broker._check_stream_token("anything"))
-        self.assertFalse(broker._check_stream_token(""))
+    def test_check_rejects_when_no_token_set(self):
+        self.assertIn("no stream session", broker._check_stream_token("anything"))
+        self.assertIn("no stream token", broker._check_stream_token(""))
 
     def test_clear_invalidates(self):
         tok = broker._issue_stream_token()
         broker._clear_stream_token()
         self.assertIsNone(broker._session["stream_token"])
-        self.assertFalse(broker._check_stream_token(tok))
+        self.assertIsNotNone(broker._check_stream_token(tok))
 
-    def test_reissue_replaces_previous_token(self):
+
+class StreamTokenLifetimeTests(unittest.TestCase):
+    """The TTL closes an abandoned session; the grace window keeps an open tab
+    alive across a relaunch. Both are wall-clock behaviours, so these tests
+    move the deadlines rather than sleeping."""
+
+    def setUp(self):
+        broker._clear_stream_token()
+
+    def test_issued_token_carries_a_ttl(self):
+        broker._issue_stream_token()
+        remaining = broker._session["stream_expires"] - time.monotonic()
+        self.assertGreater(remaining, broker.STREAM_TOKEN_TTL - 5)
+
+    def test_expired_token_is_rejected(self):
+        tok = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() - 1
+        self.assertIn("expired", broker._check_stream_token(tok))
+
+    def test_use_slides_the_expiry_forward(self):
+        tok = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() + 5
+        self.assertIsNone(broker._check_stream_token(tok))
+        remaining = broker._session["stream_expires"] - time.monotonic()
+        self.assertGreater(remaining, broker.STREAM_TOKEN_TTL - 5)
+
+    def test_reissue_keeps_the_old_token_alive_briefly(self):
         first = broker._issue_stream_token()
         second = broker._issue_stream_token()
         self.assertNotEqual(first, second)
-        self.assertFalse(broker._check_stream_token(first))
-        self.assertTrue(broker._check_stream_token(second))
+        # Both work while the grace window is open: an already-open tab is
+        # still replaying the old cookie when RomM navigates to the new URL.
+        self.assertIsNone(broker._check_stream_token(first))
+        self.assertIsNone(broker._check_stream_token(second))
+
+    def test_superseded_token_dies_when_the_grace_window_closes(self):
+        first = broker._issue_stream_token()
+        second = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_prev_expires"] = time.monotonic() - 1
+        self.assertIn("superseded", broker._check_stream_token(first))
+        self.assertIsNone(broker._check_stream_token(second))
+
+    def test_grace_does_not_survive_an_explicit_clear(self):
+        first = broker._issue_stream_token()
+        broker._issue_stream_token()
+        broker._clear_stream_token()
+        self.assertIsNotNone(broker._check_stream_token(first))
+
+    def test_live_token_reported_only_while_valid(self):
+        tok = broker._issue_stream_token()
+        self.assertEqual(broker._live_stream_token(), tok)
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() - 1
+        self.assertIsNone(broker._live_stream_token())
 
 
 class StreamProxyHelperTests(unittest.TestCase):
@@ -753,16 +803,19 @@ class VerifyStreamDecisionTests(unittest.TestCase):
     bootstrap hands back the stream_sid Set-Cookie."""
 
     def setUp(self):
+        broker._clear_stream_token()
         with broker._session_lock:
             broker._session["stream_token"] = "good"
+            broker._session["stream_expires"] = time.monotonic() + 3600
 
     def test_no_token_is_403(self):
-        status, cookie = broker._verify_stream_decision("/", None)
+        status, cookie, reason = broker._verify_stream_decision("/", None)
         self.assertEqual(status, 403)
         self.assertIsNone(cookie)
+        self.assertIn("no stream token", reason)
 
     def test_valid_query_token_admits_and_sets_cookie(self):
-        status, cookie = broker._verify_stream_decision(
+        status, cookie, reason = broker._verify_stream_decision(
             "/?stream_token=good", None
         )
         self.assertEqual(status, 200)
@@ -770,24 +823,48 @@ class VerifyStreamDecisionTests(unittest.TestCase):
             cookie,
             "stream_sid=good; HttpOnly; Secure; SameSite=None; Partitioned; Path=/",
         )
+        self.assertIsNone(reason)
 
     def test_valid_cookie_admits_without_set_cookie(self):
-        status, cookie = broker._verify_stream_decision(
+        status, cookie, _ = broker._verify_stream_decision(
             "/", "stream_sid=good; other=1"
         )
         self.assertEqual(status, 200)
         self.assertIsNone(cookie)
 
     def test_wrong_query_token_is_403(self):
-        status, cookie = broker._verify_stream_decision(
+        status, cookie, reason = broker._verify_stream_decision(
             "/?stream_token=bad", None
         )
         self.assertEqual(status, 403)
         self.assertIsNone(cookie)
+        self.assertIn("does not match", reason)
 
     def test_wrong_cookie_is_403(self):
-        status, _ = broker._verify_stream_decision("/", "stream_sid=bad")
+        status, _, _ = broker._verify_stream_decision("/", "stream_sid=bad")
         self.assertEqual(status, 403)
+
+    def test_stale_cookie_plus_fresh_query_token_recookies_the_browser(self):
+        # The relaunch case: the tab still holds the superseded stream_sid but
+        # the new iframe URL carries the current token. The query wins, and the
+        # response must carry the new cookie or the tab drops out the moment
+        # the grace window closes.
+        with broker._session_lock:
+            broker._session["stream_prev_token"] = "stale"
+            broker._session["stream_prev_expires"] = time.monotonic() + 60
+        status, cookie, _ = broker._verify_stream_decision(
+            "/?stream_token=good", "stream_sid=stale"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("stream_sid=good", cookie)
+
+    def test_superseded_cookie_alone_still_admits_during_grace(self):
+        with broker._session_lock:
+            broker._session["stream_prev_token"] = "stale"
+            broker._session["stream_prev_expires"] = time.monotonic() + 60
+        status, _, reason = broker._verify_stream_decision("/", "stream_sid=stale")
+        self.assertEqual(status, 200)
+        self.assertIsNone(reason)
 
 
 class ErrorLoggingTests(unittest.TestCase):
