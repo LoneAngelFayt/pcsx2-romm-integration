@@ -228,6 +228,16 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 **RomM shows no play button.** Confirm `streaming.enabled: true`, confirm the platform slug matches, restart RomM after config changes, and check what RomM thinks it has: `curl http://romm:5000/api/streaming/config`.
 
+**"A critical video error occurred. Resetting to default settings and reloading...", two or three times before the stream finally plays.** This is Selkies' client-side decoder fallback, not the broker. The browser's WebCodecs `VideoDecoder` throws a fatal error on the H.264 stream, so the client closes the WebSocket, downgrades its encoder setting, and reloads after three seconds. On the third failure it switches to `jpeg`, which forces CPU encoding and works, which is why it always plays *eventually*. It never self-heals, because the client zeroes its crash counter when it lands on `jpeg` and the next launch starts over from the server default.
+
+The usual cause is the hardware encoder: Selkies routes `x264enc` through VAAPI whenever a render node is present, and the container log shows `[Wayland] Initializing Unified VAAPI Encoder...` right before each crash. Force software encoding to keep H.264 without the VAAPI path:
+
+```yaml
+- SELKIES_USE_CPU=true
+```
+
+Confirm it took with `docker logs pcsx2 | grep -E "VAAPI|CPU Software"`. If it still cycles, drop to `SELKIES_ENCODER=jpeg` to skip H.264 entirely, at a real cost in bandwidth and sharpness.
+
 **"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: either the mod's init never patched nginx (`docker logs pcsx2 | grep broker-mod`), or your reverse proxy is reaching the ungated plain-HTTP vhost on port 3000 instead of the SSL vhost on 3001. Point it at 3001 and do not publish 3000: the gate is the only thing standing between the ROM library and anyone who finds the address.
 
 ## Development
