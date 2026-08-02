@@ -118,7 +118,7 @@ Save states don't care about any of this. The requirement is only for memory-car
 | `STATE_GET_WAIT` | `30.0` | How long `GET /state-file` waits for an in-flight save before giving up. |
 | `RESUME_LOAD_WAIT` | `90.0` | How long a `load_slot` launch waits for the game VM to report running. |
 | `RESUME_LOAD_SETTLE` | `3.0` | Grace period after the VM reports running, before the deferred state load fires. |
-| `BROKER_INITIAL_SLOT` | `1` | Slot the broker assumes PCSX2 booted on when it can't read `SaveStateSlot` from the ini. Only matters for xdotool cycling. |
+| `BROKER_INITIAL_SLOT` | `1` | Slot the broker assumes PCSX2 booted on. PCSX2 never reports its real one, so this is the seed the xdotool cycling tracks from. Only matters for xdotool cycling. |
 | `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | Captures pcsx2-qt stdout and stderr. Renderer and Vulkan failures show up here. Appended across launches. |
 | `BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. The xdotool window-found messages are DEBUG. |
 | `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for PCSX2, which runs as `abc` and has to overwrite them later. |

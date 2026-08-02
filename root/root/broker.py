@@ -487,39 +487,25 @@ def _patch_ini():
         log.exception("PCSX2.ini patch failed unexpectedly  broker settings NOT applied")
 
 
-def _read_initial_save_slot() -> int:
-    """Best-effort read of PCSX2's last-used save slot from PCSX2.ini.
+def _initial_save_slot() -> int:
+    """Slot the broker assumes PCSX2 boots on, from BROKER_INITIAL_SLOT (default 1).
 
-    PCSX2 persists the active save state slot in [EmuCore] under
-    `SaveStateSlot`. If the key is absent or the file is unreadable, fall
-    back to the BROKER_INITIAL_SLOT env var (default 1). Used by the launch
-    handler to seed the slot tracker so xdotool save-state cycling targets
-    the right slot on the first save after launch.
+    There is no way to learn PCSX2's real starting slot. It is not persisted to
+    PCSX2.ini (verified on 2.6.3: cycling the slot with F2 mid-game never writes
+    a SaveStateSlot key, not on cycle, not on graceful shutdown) and PINE has no
+    command to query it. So the launch handler seeds the tracker from this env
+    var and _xdotool_cycle_to_slot keeps it in step from there. Operators who
+    change the slot outside the broker will desync it until the next launch.
     """
-    fallback = int(os.environ.get("BROKER_INITIAL_SLOT", "1"))
-    if not INI_PATH.exists():
-        return fallback
+    raw = os.environ.get("BROKER_INITIAL_SLOT", "1")
     try:
-        section = ""
-        for raw in INI_PATH.read_text().splitlines():
-            line = raw.strip()
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1]
-                continue
-            if section != "EmuCore":
-                continue
-            if line.startswith("SaveStateSlot =") or line.startswith("SaveStateSlot="):
-                _, _, value = line.partition("=")
-                try:
-                    n = int(value.strip())
-                except ValueError:
-                    return fallback
-                if 1 <= n <= 10:
-                    return n
-                return fallback
-    except OSError as exc:
-        log.debug("Could not read SaveStateSlot from PCSX2.ini: %s", exc)
-    return fallback
+        slot = int(raw)
+    except ValueError:
+        slot = 0
+    if not 1 <= slot <= 10:
+        log.warning("BROKER_INITIAL_SLOT=%r is not a slot in 1-10; assuming 1", raw)
+        return 1
+    return slot
 
 
 def _kill_pcsx2():
@@ -603,15 +589,14 @@ def _launch_pcsx2_internal(rom_path):
         if log_fh:
             log_fh.close()
 
-    initial_slot = _read_initial_save_slot()
+    initial_slot = _initial_save_slot()
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
         # An instance is up again  whatever the limiter concluded is stale.
         _session["relaunch_abandoned"] = False
-        # PCSX2's persisted slot from PCSX2.ini, or BROKER_INITIAL_SLOT.
-        # We can't query PCSX2 for its live slot, so this is a best-effort seed
-        # that tracks the same value PCSX2 itself loads on startup.
+        # BROKER_INITIAL_SLOT. PCSX2 neither persists nor exposes its live slot,
+        # so this is an assumption the xdotool cycling then tracks, not a read.
         _session["current_slot"] = initial_slot
     log.info("PCSX2 launched (PID %d, initial save slot %d)", proc.pid, initial_slot)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
@@ -1608,8 +1593,8 @@ def _memcards_dir() -> Path:
 
 
 def _slot1_filename() -> str | None:
-    """Read [MemoryCards] Slot1_Filename from PCSX2.ini (manual parse, matching
-    _read_initial_save_slot). Returns the configured card name, or None."""
+    """Read [MemoryCards] Slot1_Filename from PCSX2.ini by manual line scan.
+    Returns the configured card name, or None."""
     if not INI_PATH.exists():
         return None
     try:

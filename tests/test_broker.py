@@ -225,7 +225,7 @@ class MemoryCardTests(_TempRootMixin, unittest.TestCase):
         self.assertIn("File memory card", broker._replace_memory_card(self._zip({"a": b"b"})))
 
     def test_absent_card_reports_none_not_error(self):
-        """A missing card must be distinguishable from a broken one — the
+        """A missing card must be distinguishable from a broken one: the
         handler turns None into the tagged 404 the backend keys on."""
         self.assertIsNone(broker._build_memory_card_archive())
 
@@ -271,17 +271,26 @@ class IniTests(unittest.TestCase):
         broker._patch_ini()
         self.assertEqual(first, self.ini.read_text())
 
-    def test_initial_slot_read_from_ini(self):
-        self.ini.write_text("[EmuCore]\nSaveStateSlot = 7\n")
-        self.assertEqual(broker._read_initial_save_slot(), 7)
 
-    def test_initial_slot_falls_back_when_out_of_range(self):
-        self.ini.write_text("[EmuCore]\nSaveStateSlot = 99\n")
-        self.assertEqual(broker._read_initial_save_slot(), 1)
+class InitialSlotTests(unittest.TestCase):
+    """The seed comes from the env only. PCSX2 2.6.3 never writes a
+    SaveStateSlot key to its ini, so there is nothing on disk to read."""
 
-    def test_initial_slot_falls_back_when_absent(self):
-        self.ini.write_text("[EmuCore]\n")
-        self.assertEqual(broker._read_initial_save_slot(), 1)
+    def test_reads_env_var(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "7"}):
+            self.assertEqual(broker._initial_save_slot(), 7)
+
+    def test_defaults_to_one_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(broker._initial_save_slot(), 1)
+
+    def test_falls_back_when_out_of_range(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "99"}):
+            self.assertEqual(broker._initial_save_slot(), 1)
+
+    def test_falls_back_when_not_a_number(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "seven"}):
+            self.assertEqual(broker._initial_save_slot(), 1)
 
 
 class SlotMatchTests(unittest.TestCase):
@@ -398,7 +407,7 @@ class LifecycleTests(unittest.TestCase):
         log_path = Path(tempfile.mkdtemp()) / "pcsx2-qt.log"
         with mock.patch.object(broker, "PCSX2_LOG_PATH", log_path), \
              mock.patch.object(broker.subprocess, "Popen", return_value=self.proc), \
-             mock.patch.object(broker, "_read_initial_save_slot", return_value=1), \
+             mock.patch.object(broker, "_initial_save_slot", return_value=1), \
              mock.patch.object(broker, "Thread") as thread:
             thread.return_value.start.return_value = None
             broker._launch_pcsx2_internal(None)
@@ -452,7 +461,7 @@ class GpuEnvTests(unittest.TestCase):
         with mock.patch.object(broker, "ENV", env), \
              mock.patch.object(broker, "PCSX2_LOG_PATH", log_path), \
              mock.patch.object(broker.subprocess, "Popen") as popen, \
-             mock.patch.object(broker, "_read_initial_save_slot", return_value=1), \
+             mock.patch.object(broker, "_initial_save_slot", return_value=1), \
              mock.patch.object(broker, "Thread") as thread:
             thread.return_value.start.return_value = None
             broker._launch_pcsx2_internal(None)
