@@ -13,6 +13,7 @@ container.
 """
 
 import io
+import json
 import os
 import sys
 import tempfile
@@ -634,6 +635,10 @@ class _FakeHandler(broker.BrokerHandler):
         self.path = path
         self._body = body
         self.sent = None
+        # _guarded logs these on the way out; without them a handler raising
+        # inside a test would fail in the logger instead of reporting itself.
+        self.command = "POST"
+        self.client_address = ("127.0.0.1", 0)
 
     def _check_secret(self):
         return True
@@ -783,6 +788,84 @@ class VerifyStreamDecisionTests(unittest.TestCase):
     def test_wrong_cookie_is_403(self):
         status, _ = broker._verify_stream_decision("/", "stream_sid=bad")
         self.assertEqual(status, 403)
+
+
+class ErrorLoggingTests(unittest.TestCase):
+    """Every rejection and fault has to reach stdout, not just the response
+    body. The access line is DEBUG and the default level is INFO, so an
+    unlogged error response is invisible to whoever is reading the logs."""
+
+    def _handler(self, path="/status", command="GET"):
+        h = broker.BrokerHandler.__new__(broker.BrokerHandler)
+        h.path = path
+        h.command = command
+        h.client_address = ("10.0.0.5", 51234)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        return h
+
+    def test_4xx_logs_a_warning_naming_the_route_caller_and_reason(self):
+        h = self._handler("/state-file?slot=9")
+        with self.assertLogs("broker", level="WARNING") as cm:
+            h._send_json(404, {"error": "no state file for slot", "slot": 9})
+        line = cm.output[0]
+        self.assertIn("WARNING", line)
+        self.assertIn("HTTP 404 GET /state-file?slot=9 from 10.0.0.5", line)
+        self.assertIn("no state file for slot", line)
+        self.assertIn("slot=9", line)
+
+    def test_5xx_logs_at_error_and_keeps_the_detail_field(self):
+        h = self._handler("/volume", "POST")
+        with self.assertLogs("broker", level="ERROR") as cm:
+            h._send_json(500, {"error": "pactl failed", "detail": "no such sink"})
+        line = cm.output[0]
+        self.assertIn("ERROR", line)
+        self.assertIn("pactl failed", line)
+        self.assertIn("detail=no such sink", line)
+
+    def test_success_responses_are_not_logged_as_failures(self):
+        h = self._handler()
+        with self.assertNoLogs("broker", level="WARNING"):
+            h._send_json(200, {"ok": True})
+
+    def test_unhandled_exception_logs_a_traceback_and_still_answers_500(self):
+        h = self._handler("/status")
+
+        def boom():
+            raise RuntimeError("simulated PINE explosion")
+
+        with self.assertLogs("broker", level="ERROR") as cm:
+            h._guarded(boom)
+        joined = "\n".join(cm.output)
+        self.assertIn("unhandled error in the broker request handler", joined)
+        self.assertIn("simulated PINE explosion", joined)
+        self.assertIn("Traceback", joined)
+        self.assertEqual(
+            json.loads(h.wfile.getvalue().decode())["error"], "internal broker error"
+        )
+
+    def test_client_disconnect_is_a_warning_not_a_traceback(self):
+        h = self._handler()
+
+        def gone():
+            raise BrokenPipeError()
+
+        with self.assertLogs("broker", level="WARNING") as cm:
+            h._guarded(gone)
+        joined = "\n".join(cm.output)
+        self.assertIn("client disconnected before the response was sent", joined)
+        self.assertNotIn("Traceback", joined)
+
+    def test_stream_token_never_reaches_the_log(self):
+        self.assertEqual(
+            broker._redact_uri("/websockify?stream_token=SUPERSECRET&x=1"),
+            "/websockify?stream_token=REDACTED&x=1",
+        )
+
+    def test_redaction_leaves_an_ordinary_uri_alone(self):
+        self.assertEqual(broker._redact_uri("/state-file?slot=3"), "/state-file?slot=3")
 
 
 if __name__ == "__main__":

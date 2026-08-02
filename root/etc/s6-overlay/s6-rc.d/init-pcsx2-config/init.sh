@@ -1,9 +1,9 @@
 #!/usr/bin/with-contenv bash
 
-# Clean up stale Wayland and X11 sockets to ensure the compositor starts on the 
-# default display indices (wayland-0, :0) even if the container was killed 
-# forcefully. Persistence of these lock files on the host-mapped /config 
-# folder causes them to increment (wayland-1, :1, etc.) on relaunch, which 
+# Clean up stale Wayland and X11 sockets to ensure the compositor starts on the
+# default display indices (wayland-0, :0) even if the container was killed
+# forcefully. Persistence of these lock files on the host-mapped /config
+# folder causes them to increment (wayland-1, :1, etc.) on relaunch, which
 # breaks the hardcoded display expectations of the broker and stream.
 XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"

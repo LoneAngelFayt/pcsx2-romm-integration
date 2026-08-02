@@ -208,6 +208,8 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 ## Troubleshooting
 
+**Reading the logs.** Every request the broker refuses or fails is logged to stdout, not only returned as JSON, so `docker logs pcsx2` is enough to see what went wrong without turning on `DEBUG`. The shape is `HTTP <code> <method> <path> from <caller>: <reason>`. A `WARNING` is a caller-side rejection (bad slot, no game running, a claim already held); an `ERROR` is a broker-side fault (pactl failed, a state file that could not be written) and always deserves attention. An unhandled crash inside a handler logs a full traceback and still answers `500 internal broker error` rather than dropping the connection. Stream tokens are redacted from logged URLs, so log output is safe to paste into a bug report.
+
 **The mod doesn't apply, or the broker never starts.** Check the image name (`ghcr.io/loneangelfayt/pcsx2-romm-integration-mod`), confirm the base image is `lscr.io/linuxserver/pcsx2:latest` or compatible, and run `docker compose up` without `-d` to watch the whole startup.
 
 **Black screen for more than a minute.** 15-30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).

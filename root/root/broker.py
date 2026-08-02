@@ -1732,6 +1732,16 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _redact_uri(uri: str) -> str:
+    """Strip the stream token out of a URI before it reaches the log.
+
+    The stream gate admits a viewer on `?stream_token=...`, so logging a raw
+    request line would put a live credential in stdout, where it is exactly the
+    text an operator pastes into a bug report.
+    """
+    return re.sub(r"(stream_token=)[^&]*", r"\1REDACTED", uri)
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -1755,9 +1765,69 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self.headers.get("Cookie"),
         )
         headers = {"Set-Cookie": set_cookie} if set_cookie else None
-        self._send_json(status, {"ok": status == 200}, headers)
+        body = {"ok": status == 200}
+        if status != 200:
+            body["error"] = "stream token missing, expired, or already claimed"
+        self._send_json(status, body, headers)
+
+    def _log_error_response(self, code: int, body: dict) -> None:
+        """Announce every 4xx/5xx on stdout, not just in the response body.
+
+        The access line is DEBUG and the default level is INFO, so without this
+        a rejected or failed request is invisible to an operator reading
+        container logs: the integration looks like it did nothing at all. 5xx
+        is a broker-side fault (ERROR), 4xx is a caller-side one (WARNING).
+        """
+        reason = body.get("error", "request rejected")
+        if not isinstance(reason, str):
+            reason = json.dumps(reason)
+        # Everything else in the body is context the operator wants (slot,
+        # path, pactl stderr). "ok" is the /verify flag, already implied.
+        extras = ", ".join(
+            f"{k}={v}" for k, v in body.items() if k not in ("error", "ok")
+        )
+        emit = log.error if code >= 500 else log.warning
+        emit(
+            "HTTP %d %s %s from %s: %s%s",
+            code,
+            self.command,
+            _redact_uri(self.path),
+            self.client_address[0],
+            reason,
+            f" ({extras})" if extras else "",
+        )
+
+    def _guarded(self, handler) -> None:
+        """Run a do_* handler so no failure mode can exit without a trace.
+
+        An exception escaping the handler otherwise unwinds into socketserver,
+        which prints a bare traceback to stderr outside the broker's log format
+        and leaves the caller with a reset connection and no response at all.
+        """
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            log.warning(
+                "HTTP %s %s from %s: client disconnected before the response was sent",
+                self.command,
+                _redact_uri(self.path),
+                self.client_address[0],
+            )
+        except Exception:
+            log.exception(
+                "HTTP %s %s from %s: unhandled error in the broker request handler",
+                self.command,
+                _redact_uri(self.path),
+                self.client_address[0],
+            )
+            try:
+                self._send_json(500, {"error": "internal broker error"})
+            except Exception:
+                log.error("Could not send the 500 response, the connection is already gone")
 
     def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
+        if code >= 400:
+            self._log_error_response(code, body)
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -1991,6 +2061,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok", "written": written})
 
     def do_PUT(self):
+        self._guarded(self._handle_PUT)
+
+    def _handle_PUT(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
@@ -2046,6 +2119,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok", "filename": filename})
 
     def do_GET(self):
+        self._guarded(self._handle_GET)
+
+    def _handle_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
             self._send_json(200, {"status": "ok"})
@@ -2086,6 +2162,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._guarded(self._handle_POST)
+
+    def _handle_POST(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
@@ -2326,6 +2405,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         })
 
     def do_DELETE(self):
+        self._guarded(self._handle_DELETE)
+
+    def _handle_DELETE(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
