@@ -72,11 +72,18 @@ echo "[broker-mod] Disabled labwc autostart."
 # Patch the selkies input_handler.py keep-alive loop to check reader.at_eof().
 # Without this, idle gamepad sockets never detect client disconnection because
 # asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
-# Glob over the python version so the patch survives base image upgrades that
-# bump e.g. python3.12 → python3.13.
-INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
-INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.12/site-packages/selkies/input_handler.py}"
-if [ -f "$INPUT_HANDLER" ]; then
+# Search the known install roots rather than assuming one: a base image that
+# moves selkies out of /lsiopy, or bumps e.g. python3.12 → python3.13, must not
+# silently cost us the patch. The find is scoped to these roots, not /, so it
+# stays cheap at container start.
+INPUT_HANDLER=""
+for _root in /lsiopy /usr/lib /usr/local/lib /opt /config/.local; do
+    [ -d "$_root" ] || continue
+    INPUT_HANDLER=$(find "$_root" -path "*/selkies/input_handler.py" -type f 2>/dev/null | head -1)
+    [ -n "$INPUT_HANDLER" ] && break
+done
+if [ -n "$INPUT_HANDLER" ]; then
+    echo "[broker-mod] selkies input_handler.py found at $INPUT_HANDLER"
     if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies input_handler.py EOF patch already applied."
     else
@@ -94,20 +101,43 @@ if [ -f "$INPUT_HANDLER" ]; then
 
     # Silence the selkies_gamepad logger: it emits ~80 INFO lines per launch cycle
     # (handler started/finished, config sent, arch specifier, active list changes ×8
-    # sockets). Demote to WARNING to keep errors/warnings while clearing the spam.
-    if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
+    # sockets), which buries the broker's own output. Demote to WARNING to keep
+    # errors and warnings while clearing the spam.
+    #
+    # Appended to the end of the module instead of sed-ing the assignment line.
+    # An anchor can stop matching when upstream renames its variable, and that
+    # failure is silent; appending always applies. Setting the level by logger
+    # name reaches the same singleton whatever upstream calls its local. This
+    # holds because selkies only ever calls basicConfig(level=INFO), which sets
+    # the root logger and does not touch a child's explicit level, and nothing
+    # upstream re-sets this one.
+    GAMEPAD_MARKER="pcsx2-broker-mod:gamepad-loglevel"
+    if grep -q "$GAMEPAD_MARKER" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies_gamepad log-level patch already applied."
     else
-        if sed -i \
-            's/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")/logger_selkies_gamepad = logging.getLogger("selkies_gamepad")\nlogger_selkies_gamepad.setLevel(logging.WARNING)/' \
-            "$INPUT_HANDLER"; then
+        cat >> "$INPUT_HANDLER" <<'PYEOF'
+
+# pcsx2-broker-mod:gamepad-loglevel
+# Demote the gamepad chatter so the broker's log stays readable. See the
+# pcsx2-romm-integration init script for why this is appended, not patched.
+import logging as _bm_logging
+_bm_logging.getLogger("selkies_gamepad").setLevel(_bm_logging.WARNING)
+PYEOF
+        # Confirm both that the marker landed and that the file still parses:
+        # a half-written append would take selkies down with it, which is a far
+        # worse outcome than noisy logs.
+        if ! grep -q "$GAMEPAD_MARKER" "$INPUT_HANDLER"; then
+            echo "[broker-mod] ERROR: could not append the selkies_gamepad log-level patch to $INPUT_HANDLER (read-only filesystem?), gamepad INFO spam will remain"
+        elif ! command -v python3 >/dev/null 2>&1 \
+             || python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$INPUT_HANDLER" 2>/dev/null; then
             echo "[broker-mod] Patched selkies_gamepad log level to WARNING."
         else
-            echo "[broker-mod] ERROR: sed patch failed setting selkies_gamepad log level"
+            echo "[broker-mod] ERROR: input_handler.py no longer parses after the log-level patch, reverting"
+            sed -i "/# $GAMEPAD_MARKER/,\$d" "$INPUT_HANDLER"
         fi
     fi
 else
-    echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
+    echo "[broker-mod] ERROR: selkies input_handler.py not found under /lsiopy, /usr/lib, /usr/local/lib, /opt or /config/.local, so neither the gamepad EOF fix nor the log-level patch was applied"
 fi
 
 # Gate the browser-facing stream with nginx auth_request. The 3001 SSL vhost is

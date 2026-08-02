@@ -214,7 +214,7 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 **Black screen for more than a minute.** 15-30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).
 
-**Controllers dead.** Try `POST /cleanup` to restart Selkies and flush stale sockets. Confirm the sockets exist at all with `docker exec pcsx2 ls /tmp/selkies_js*.sock`, and check the broker logs for `LD_PRELOAD`.
+**Controllers dead.** Try `POST /cleanup` to restart Selkies and flush stale sockets. Confirm the sockets exist at all with `docker exec pcsx2 ls /tmp/selkies_js*.sock`, and check the broker logs for `LD_PRELOAD`. The mod pins the `selkies_gamepad` logger to `WARNING`, so the absence of per-socket `INFO:selkies_gamepad:` chatter is expected and not a sign the gamepads are gone; real gamepad warnings and errors still come through. Startup logs whether that patch applied, so `docker logs pcsx2 | grep broker-mod` tells you if it silently missed.
 
 **Saves failing.** `docker logs pcsx2 | grep PINE`. No xdotool lines at all is healthy: xdotool only appears when PINE is unreachable. If you do see `PINE unavailable`, look for xdotool output, and remember the "found window" message is DEBUG-level while the "window not found" warning shows by default. Bump `PINE_WAIT` if saves are just slow, and check what actually landed with `docker exec pcsx2 ls /config/.config/PCSX2/sstates`.
 
