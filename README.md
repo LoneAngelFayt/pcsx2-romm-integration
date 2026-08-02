@@ -111,7 +111,7 @@ Save states don't care about any of this. The requirement is only for memory-car
 | `BROKER_SECRET` | *(none)* | Shared secret, sent as `X-Broker-Secret`. Unset means every request is accepted, which is not safe on a shared network. |
 | `BROKER_PORT` | `8000` | Port the broker listens on. |
 | `ROM_ROOT` | `/romm/library` | Where ROMs are mounted. A `rom_path` outside this is rejected. |
-| `SAVE_SLOT` | `10` | Slot `/save-and-exit` uses when none is given. 10 as autosave leaves 1–9 for the player. |
+| `SAVE_SLOT` | `10` | Slot `/save-and-exit` uses when none is given. 10 as autosave leaves 1-9 for the player. |
 | `PINE_WAIT` | `20.0` | Seconds to poll for a state write to land after a save is accepted. Stops early once the file appears. Raise it for slow disks. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes `.p2s` files, and where `/state-file` reads and writes them. |
 | `SAVE_DATA_ROOT` | `/config/.config/PCSX2` | PCSX2 data dir for `/save-file` and `/memory-card`. Only `memcards/` under it is synced. |
@@ -148,7 +148,7 @@ JSON bodies are capped at 64 KB and file bodies at 256 MB. Anything larger is a 
 | `POST /mute` | `{"mute": true}`, or omit `mute` to toggle. The response is read back from PulseAudio, not echoed | `500` pactl failed |
 | `POST /cleanup` | Restart Selkies to flush stale gamepad sockets. Use it if controllers go dead | none |
 
-Slots are 1–10 everywhere. `/save-and-exit` and `GET /state-file` also accept `0`, which means "use `SAVE_SLOT`".
+Slots are 1-10 everywhere. `/save-and-exit` and `GET /state-file` also accept `0`, which means "use `SAVE_SLOT`".
 
 ### Session state
 
@@ -186,7 +186,7 @@ That last row is almost always a GPU or renderer failure, and `PCSX2_LOG_PATH` w
 
 A folder with nothing bootable in it returns `422` with an `extensions` list, which is a different message from the `422` for a path that doesn't exist. Every broker in this family behaves the same way here.
 
-`load_slot` (1–10) resumes from a state. The broker waits for the VM to report running over PINE, gives it `RESUME_LOAD_SETTLE` seconds to settle, then loads. Push the state file with `PUT /state-file` *before* you launch.
+`load_slot` (1-10) resumes from a state. The broker waits for the VM to report running over PINE, gives it `RESUME_LOAD_SETTLE` seconds to settle, then loads. Push the state file with `PUT /state-file` *before* you launch.
 
 ### Saving is asynchronous
 
@@ -210,7 +210,7 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 **The mod doesn't apply, or the broker never starts.** Check the image name (`ghcr.io/loneangelfayt/pcsx2-romm-integration-mod`), confirm the base image is `lscr.io/linuxserver/pcsx2:latest` or compatible, and run `docker compose up` without `-d` to watch the whole startup.
 
-**Black screen for more than a minute.** 15–30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).
+**Black screen for more than a minute.** 15-30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).
 
 **Controllers dead.** Try `POST /cleanup` to restart Selkies and flush stale sockets. Confirm the sockets exist at all with `docker exec pcsx2 ls /tmp/selkies_js*.sock`, and check the broker logs for `LD_PRELOAD`.
 

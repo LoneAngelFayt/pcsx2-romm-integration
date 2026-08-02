@@ -2,15 +2,15 @@
 
 # Clean up stale Wayland and X11 sockets to ensure the compositor starts on the 
 # default display indices (wayland-0, :0) even if the container was killed 
-# forcefully.  Persistence of these lock files on the host-mapped /config 
+# forcefully. Persistence of these lock files on the host-mapped /config 
 # folder causes them to increment (wayland-1, :1, etc.) on relaunch, which 
 # breaks the hardcoded display expectations of the broker and stream.
 XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"
-# Only clean when no display server is alive — if s6 ordering ever changes
+# Only clean when no display server is alive: if s6 ordering ever changes
 # and the compositor is already up, deleting its live socket kills the stream.
 if pgrep -x Xvfb >/dev/null || pgrep -x Xwayland >/dev/null || pgrep -x labwc >/dev/null; then
-    echo "[broker-mod] Display server already running — skipping socket cleanup."
+    echo "[broker-mod] Display server already running, skipping socket cleanup."
 else
     find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
     rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
@@ -18,7 +18,7 @@ else
 fi
 
 # Ensure python3 is available for the broker service, and libshaderc for
-# PCSX2's Vulkan renderer — the base image ships without it, so on a host
+# PCSX2's Vulkan renderer. The base image ships without it, so on a host
 # with a GPU the GS device fails shader compilation and pcsx2-qt exits
 # within a second of booting any game (the gameless dashboard never
 # initializes GS, masking the breakage until a game is launched).
@@ -39,7 +39,7 @@ PATCHES_ZIP="/usr/share/PCSX2/resources/patches.zip"
 if [ ! -s "$PATCHES_ZIP" ]; then
     echo "[broker-mod] Downloading PCSX2 patches.zip..."
     # Download to a temp path and verify it is a well-formed zip before
-    # installing — the release URL floats ("latest"), so a checksum can't be
+    # installing: the release URL floats ("latest"), so a checksum can't be
     # pinned, but a truncated or non-zip response must never land in place.
     # Bounded so an unresponsive GitHub can't stall container init for an
     # optional file.
@@ -63,7 +63,7 @@ chmod 0440 /etc/sudoers.d/broker
 echo "[broker-mod] sudoers rule set."
 
 # Disable the labwc autostart so pcsx2-qt isn't launched a second time by the
-# desktop session — the broker manages the process lifecycle directly.
+# desktop session: the broker manages the process lifecycle directly.
 AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
 printf '# Disabled by pcsx2-broker-mod\n' > "$AUTOSTART"
@@ -83,16 +83,16 @@ if [ -f "$INPUT_HANDLER" ]; then
         sed -i \
             's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
             "$INPUT_HANDLER"
-        # Verify the substitution actually took — sed exits 0 even when the
+        # Verify the substitution actually took: sed exits 0 even when the
         # pattern never matched, so grep is the only honest success signal.
         if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
             echo "[broker-mod] Patched selkies input_handler.py EOF detection."
         else
-            echo "[broker-mod] ERROR: input_handler.py EOF pattern not found — patch NOT applied (upstream may have changed)"
+            echo "[broker-mod] ERROR: input_handler.py EOF pattern not found, patch NOT applied (upstream may have changed)"
         fi
     fi
 
-    # Silence the selkies_gamepad logger — it emits ~80 INFO lines per launch cycle
+    # Silence the selkies_gamepad logger: it emits ~80 INFO lines per launch cycle
     # (handler started/finished, config sent, arch specifier, active list changes ×8
     # sockets). Demote to WARNING to keep errors/warnings while clearing the spam.
     if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then

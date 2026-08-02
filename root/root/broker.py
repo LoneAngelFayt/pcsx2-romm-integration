@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""broker.py  launch PCSX2 on demand and expose a small HTTP API."""
+"""broker.py: launch PCSX2 on demand and expose a small HTTP API."""
 
 import calendar
 import glob
@@ -113,8 +113,8 @@ _LD_PRELOAD_FROM_ENV = "LD_PRELOAD" in os.environ and bool(os.environ["LD_PRELOA
 # pcsx2-qt is launched through `sudo -u abc env K=V ...`, and sudo's default
 # env_reset drops everything the container was started with. Only the names
 # spelled out on that `env` line survive the hop, so every renderer knob an
-# operator sets in docker-compose VK_DRIVER_FILES, __GLX_VENDOR_LIBRARY_NAME,
-# MESA_VK_DEVICE_SELECT used to be silently discarded, leaving Vulkan to
+# operator sets in docker-compose (VK_DRIVER_FILES, __GLX_VENDOR_LIBRARY_NAME,
+# MESA_VK_DEVICE_SELECT) used to be silently discarded, leaving Vulkan to
 # enumerate on its own and settle for whatever ICD it could find (lavapipe,
 # which names itself "llvmpipe"). Forward the vendor namespaces wholesale
 # rather than an exact list so a knob we haven't heard of still arrives.
@@ -123,7 +123,7 @@ _GPU_ENV_PREFIXES = (
     "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
 )
 # XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
-# icd.d/  dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# icd.d/. Dropping it hides ICDs installed outside /usr/share. DRINODE is the
 # linuxserver base image's render-node selector, which misses the DRI_ prefix.
 _GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
 
@@ -141,7 +141,7 @@ def _gpu_env() -> dict[str, str]:
 
 
 ENV = {
-    # Inherited GPU vars come first so the computed entries below always win
+    # Inherited GPU vars come first so the computed entries below always win:
     # DISPLAY and LD_PRELOAD are derived from live container state and must not
     # be shadowed by a stale value from the container environment.
     **_gpu_env(),
@@ -175,7 +175,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("broker")
 
-# Warn if the linuxserver init didn't export LD_PRELOAD  gamepads silently
+# Warn if the linuxserver init didn't export LD_PRELOAD. Gamepads silently
 # break when only the interposer is loaded without the fake libudev. Logged
 # here (after `log` exists) rather than at module import.
 if not _LD_PRELOAD_FROM_ENV:
@@ -420,10 +420,10 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
 def _patch_ini():
     """Force broker-required PCSX2.ini settings. Each key is scoped to its
     expected section so identically-named keys in other sections aren't stomped.
-    Failures are logged loudly  silent failure here means PCSX2 launches with
+    Failures are logged loudly: silent failure here means PCSX2 launches with
     the wrong PINE/Fullscreen/Shutdown settings and downstream features break."""
     if not INI_PATH.exists():
-        log.warning("PCSX2.ini not found at %s  skipping patch", INI_PATH)
+        log.warning("PCSX2.ini not found at %s, skipping patch", INI_PATH)
         return
 
     # (section, key) → "key = value" line.
@@ -482,9 +482,9 @@ def _patch_ini():
         tmp.replace(INI_PATH)  # atomic on POSIX; prevents partial-write corruption
         log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown, SaveStateOnShutdown)")
     except OSError as exc:
-        log.error("PCSX2.ini patch failed (filesystem): %s  broker settings NOT applied", exc)
+        log.error("PCSX2.ini patch failed (filesystem): %s, broker settings NOT applied", exc)
     except Exception:
-        log.exception("PCSX2.ini patch failed unexpectedly  broker settings NOT applied")
+        log.exception("PCSX2.ini patch failed unexpectedly, broker settings NOT applied")
 
 
 def _initial_save_slot() -> int:
@@ -525,12 +525,12 @@ def _kill_pcsx2():
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            log.warning("PCSX2 did not exit after SIGTERM  sending SIGKILL")
+            log.warning("PCSX2 did not exit after SIGTERM, sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                log.error("PCSX2 did not exit after SIGKILL  giving up")
+                log.error("PCSX2 did not exit after SIGKILL, giving up")
     except ProcessLookupError:
         pass  # already gone
 
@@ -572,7 +572,7 @@ def _launch_pcsx2_internal(rom_path):
             stdout=log_fh if log_fh else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
             # New session ⇒ own process group, so killpg is clean. Unlike
-            # preexec_fn (unsafe with threads  can deadlock between fork and
+            # preexec_fn (unsafe with threads, can deadlock between fork and
             # exec in this ThreadingHTTPServer process), this is thread-safe.
             start_new_session=True,
         )
@@ -593,7 +593,7 @@ def _launch_pcsx2_internal(rom_path):
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
-        # An instance is up again  whatever the limiter concluded is stale.
+        # An instance is up again, whatever the limiter concluded is stale.
         _session["relaunch_abandoned"] = False
         # BROKER_INITIAL_SLOT. PCSX2 neither persists nor exposes its live slot,
         # so this is an assumption the xdotool cycling then tracks, not a read.
@@ -618,7 +618,7 @@ def _monitor_process(proc, start_time):
     rapid = 0
     with _session_lock:
         should_relaunch = _session["is_managed"] and _session["process"] is proc
-        # Only unexpected exits count toward the crash-loop limit  a
+        # Only unexpected exits count toward the crash-loop limit. A
         # deliberate kill (/save-and-exit, DELETE /launch) cleared is_managed
         # and must not push the counter toward a false trip.
         if should_relaunch:
@@ -633,7 +633,7 @@ def _monitor_process(proc, start_time):
 
     if rapid >= _CRASH_LOOP_LIMIT:
         log.error(
-            "PCSX2 exited within 5s %d times in a row  giving up on relaunch. "
+            "PCSX2 exited within 5s %d times in a row, giving up on relaunch. "
             "Fix the underlying failure, then POST /launch to recover.",
             rapid,
         )
@@ -643,14 +643,14 @@ def _monitor_process(proc, start_time):
 
     # Back off if the process died almost immediately to avoid a tight crash loop.
     wait_time = 5 if duration < 5 else 1
-    log.info("PCSX2 exited after %.1fs  relaunching dashboard in %ds", duration, wait_time)
+    log.info("PCSX2 exited after %.1fs, relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
 
     # The crash relaunch is a lifecycle sequence like any other: it must hold
     # the launch claim, or a concurrent /launch interleaves with it and the
     # monitor stomps the new game's session state with Dashboard.
     if not _claim_launch():
-        log.info("Crash relaunch skipped  a launch is already in progress")
+        log.info("Crash relaunch skipped, a launch is already in progress")
         return
     try:
         with _session_lock:
@@ -680,7 +680,7 @@ def _drain_gamepad_sockets():
       2. Keep-alive loop: while self.running and not writer.is_closing().
 
     Connecting and immediately sending SHUT_WR causes readexactly(1) in phase 1
-    to raise IncompleteReadError  the handler exits and removes itself from the
+    to raise IncompleteReadError, the handler exits and removes itself from the
     active client list without ever entering phase 2.
 
     Phase-2 handlers are unaffected; their loop has no EOF check. They clear on
@@ -750,8 +750,8 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
             # _kill_pcsx2 already reaped the managed process group, so any
             # survivor is an unmanaged stray. Strays sit on top of the new
             # game window, steal xdotool targeting, and unlink the live
-            # instance's PINE socket when they finally exit  reap them.
-            log.warning("Stray pcsx2-qt still running after kill+drain  sending SIGKILL")
+            # instance's PINE socket when they finally exit. Reap them.
+            log.warning("Stray pcsx2-qt still running after kill+drain, sending SIGKILL")
             subprocess.run(["pkill", "-9", "-x", "pcsx2-qt"], capture_output=True)
             if not _wait_for_no_pcsx2():
                 log.error("Stray pcsx2-qt survived SIGKILL; new instance may misbehave")
@@ -776,7 +776,7 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
         if load_slot is not None:
             # Spawned here (not by the HTTP handler) so the deferred loader
             # carries this launch's seq and aborts if a later launch lands.
-            # Skipped when Popen failed  no point polling PINE for
+            # Skipped when Popen failed, no point polling PINE for
             # RESUME_LOAD_WAIT against a VM that never started.
             with _session_lock:
                 launched = _session["process"] is not None
@@ -785,9 +785,9 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
                     target=_deferred_load_state, args=(load_slot, seq), daemon=True
                 ).start()
             else:
-                log.warning("resume: launch failed  slot %d load not scheduled", load_slot)
+                log.warning("resume: launch failed, slot %d load not scheduled", load_slot)
     finally:
-        # Only the caller that claimed launch_in_progress may release it
+        # Only the caller that claimed launch_in_progress may release it:
         # clearing it unconditionally would wipe a concurrent claim and
         # reopen the TOCTOU.
         if release_claim:
@@ -802,7 +802,7 @@ def _claim_card_op() -> bool:
     borrowing the launch claim made the monitor's crash relaunch skip and
     never retry, leaving no emulator running at all. This flag blocks GAME
     launches (which mount the card) while letting the gameless dashboard
-    recover  the dashboard never opens a memory card, and the replace is an
+    recover: the dashboard never opens a memory card, and the replace is an
     atomic staging swap, so a relaunch mid-hydrate sees either the old card
     or the new one, never a partial.
 
@@ -830,7 +830,7 @@ def _relaunch_dashboard():
     already in flight, skip: that launch's kill+start sequence supersedes
     the dashboard anyway, and interleaving the two corrupts both."""
     if not _claim_launch():
-        log.info("Dashboard relaunch skipped  a launch is already in progress")
+        log.info("Dashboard relaunch skipped, a launch is already in progress")
         return
     _launch_pcsx2(None, release_claim=True)
 
@@ -838,7 +838,7 @@ def _relaunch_dashboard():
 def _sstate_snapshot() -> dict:
     """Return {Path: (size, mtime)} for every .p2s file currently in SSTATE_DIR."""
     if not SSTATE_DIR.is_dir():
-        log.debug("Save: SSTATE_DIR absent  %s", SSTATE_DIR)
+        log.debug("Save: SSTATE_DIR absent: %s", SSTATE_DIR)
         return {}
     snap = {}
     for p in SSTATE_DIR.glob("*.p2s"):
@@ -847,7 +847,7 @@ def _sstate_snapshot() -> dict:
             snap[p] = (st.st_size, st.st_mtime)
         except OSError:
             pass
-    log.debug("Save: snapshot  %d file(s) in %s", len(snap), SSTATE_DIR)
+    log.debug("Save: snapshot: %d file(s) in %s", len(snap), SSTATE_DIR)
     return snap
 
 
@@ -859,11 +859,11 @@ def _matches_slot(p: Path, slot: int) -> bool:
 def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = None) -> bool:
     """Poll SSTATE_DIR until a save state write completes or deadline is reached.
 
-    When `slot` is given, only files named for that slot count  otherwise an
+    When `slot` is given, only files named for that slot count, otherwise an
     unrelated .p2s write (autosave, user F1) would confirm a save that never
     happened. Detects both new files and overwrites of existing ones (by mtime change).
     Once a target file is found, waits for its size to be stable for 0.5 s
-    before returning  handles both direct writes and atomic rename patterns.
+    before returning. Handles both direct writes and atomic rename patterns.
 
     Returns True if a completed write was detected, False if deadline elapsed.
     """
@@ -886,7 +886,7 @@ def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = Non
                     target = p
                     last_size = size
                     stable_since = time.monotonic()
-                    log.debug("Save: write detected  %s (%d bytes, mtime %.3f)", p.name, size, mtime)
+                    log.debug("Save: write detected: %s (%d bytes, mtime %.3f)", p.name, size, mtime)
                     break
                 else:
                     log.debug("Save: %s unchanged (mtime %.3f)", p.name, mtime)
@@ -902,7 +902,7 @@ def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = Non
                     stable_since = time.monotonic()
                 elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
                     log.info(
-                        "Save: state write complete  %s (%d bytes) in %.1fs",
+                        "Save: state write complete: %s (%d bytes) in %.1fs",
                         target.name, last_size,
                         time.monotonic() - start,
                     )
@@ -925,7 +925,7 @@ STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
 def _wait_for_save_idle(deadline: float) -> bool:
     """Block until no save is in flight. Returns False when the deadline
-    passes with a save still running  callers must refuse to serve state
+    passes with a save still running, callers must refuse to serve state
     files in that case, not ship a half-written one."""
     while time.monotonic() < deadline:
         with _session_lock:
@@ -1020,7 +1020,7 @@ def _pine_save_state(slot: int) -> bool | None:
         return None
     # PCSX2 queues the save onto the VM thread and replies immediately, so
     # confirm the actual write the same way the xdotool path does.
-    log.info("PINE: save state accepted (slot %d)  waiting for write (max %.1fs)", slot, PINE_WAIT)
+    log.info("PINE: save state accepted (slot %d), waiting for write (max %.1fs)", slot, PINE_WAIT)
     if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, slot):
         return True
     log.warning("PINE: save accepted but no state file write within %.1fs (slot %d)", PINE_WAIT, slot)
@@ -1032,7 +1032,7 @@ def _save_state(slot: int) -> bool:
     result = _pine_save_state(slot)
     if result is not None:
         return result
-    log.warning("PINE unavailable  falling back to xdotool F-key delivery")
+    log.warning("PINE unavailable, falling back to xdotool F-key delivery")
     return _xdotool_save_state(slot)
 
 
@@ -1041,7 +1041,7 @@ def _load_state(slot: int) -> bool:
     if _pine_request(_PINE_MSG_LOAD_STATE, bytes([slot])) is not None:
         log.info("PINE: load state accepted (slot %d)", slot)
         return True
-    log.warning("PINE unavailable  falling back to xdotool F-key delivery")
+    log.warning("PINE unavailable, falling back to xdotool F-key delivery")
     return _xdotool_load_state(slot)
 
 
@@ -1057,7 +1057,7 @@ def _deferred_load_state(slot: int, seq: int) -> None:
     """Resume-from-state: load `slot` once the freshly launched game's VM is up.
 
     Waits for the launch to finish swapping instances before trusting the
-    status probe  probing earlier could see a still-running previous game
+    status probe: probing earlier could see a still-running previous game
     and load the slot into the wrong VM. After the swap, only the new game
     VM reports running (a gameless relaunch reports shutdown).
 
@@ -1071,19 +1071,19 @@ def _deferred_load_state(slot: int, seq: int) -> None:
             launching = _session["launch_in_progress"]
             superseded = _session["launch_seq"] != seq
         if superseded:
-            log.info("resume: launch superseded  slot %d load abandoned", slot)
+            log.info("resume: launch superseded, slot %d load abandoned", slot)
             return
         if not launching and _pine_emu_status() == 0:
             time.sleep(RESUME_LOAD_SETTLE)
             with _session_lock:
                 if _session["launch_seq"] != seq:
-                    log.info("resume: launch superseded  slot %d load abandoned", slot)
+                    log.info("resume: launch superseded, slot %d load abandoned", slot)
                     return
             ok = _load_state(slot)
             log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
             return
         time.sleep(1.0)
-    log.warning("resume: VM never reached running state  slot %d not loaded", slot)
+    log.warning("resume: VM never reached running state, slot %d not loaded", slot)
 
 
 _XDOTOOL_ENV = {
@@ -1148,7 +1148,7 @@ def _xdotool_find_window() -> str | None:
         log.warning("xdotool: classname fallback failed to invoke: %s", exc)
 
     log.warning(
-        "xdotool: PCSX2 window not found (PIDs %s, last error: %s)  F-key shortcuts will not be delivered",
+        "xdotool: PCSX2 window not found (PIDs %s, last error: %s), F-key shortcuts will not be delivered",
         pids, last_search_err,
     )
     return None
@@ -1252,7 +1252,7 @@ def _xdotool_save_state(slot: int) -> bool:
         return False
 
     log.info(
-        "xdotool: F1 sent to window %s (slot %d)  waiting for write (max %.1fs)",
+        "xdotool: F1 sent to window %s (slot %d), waiting for write (max %.1fs)",
         wid, slot, PINE_WAIT,
     )
     deadline = time.monotonic() + PINE_WAIT
@@ -1341,7 +1341,7 @@ def _pactl(*args: str) -> subprocess.CompletedProcess:
 
 
 def _pactl_get_volume() -> int | None:
-    """Return current sink volume as an integer 0–100, or None on error."""
+    """Return current sink volume as an integer 0-100, or None on error."""
     result = _pactl("get-sink-volume", "@DEFAULT_SINK@")
     if result.returncode != 0:
         return None
@@ -1380,9 +1380,9 @@ SAVE_SYNC_SUBTREES = ("memcards",)
 # subfolder, so 256 MB is far above anything real. It is a hard ceiling, not a
 # tunable: exceeding it fails the sync outright (GET 413 / PUT 413), it is NOT
 # read from the environment, and both the whole archive and the extracted size
-# are held in memory. If a card ever legitimately grows past this  a card pool
+# are held in memory. If a card ever legitimately grows past this (a card pool
 # far larger than expected, or a future non-memcard subtree added to
-# SAVE_SYNC_SUBTREES  raising the number alone is not enough: the transfer has
+# SAVE_SYNC_SUBTREES) raising the number alone is not enough: the transfer has
 # to move to streaming/chunked I/O first, or the broker will OOM before it hits
 # the limit. Same reasoning applies to STATE_FILE_MAX_BYTES above.
 SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
@@ -1439,7 +1439,7 @@ def _read_file_stable(
             data = p.read_bytes()
             st_after = p.stat()
         except OSError as exc:
-            log.warning("save-file: could not read %s  %s", p, exc)
+            log.warning("save-file: could not read %s: %s", p, exc)
             return None
         if (st_before.st_size, st_before.st_mtime_ns) == (
             st_after.st_size,
@@ -1448,14 +1448,14 @@ def _read_file_stable(
             return data, st_after.st_mtime
         if attempt < retries - 1:
             time.sleep(settle)
-    log.warning("save-file: %s still being written  skipped this pull", p)
+    log.warning("save-file: %s still being written, skipped this pull", p)
     return None
 
 
 def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | str:
     """Zip every save file modified since the last game launch.
 
-    Returns (zip_bytes, skipped)  `skipped` counts files left out because
+    Returns (zip_bytes, skipped). `skipped` counts files left out because
     they were unreadable or still being written; zip_bytes is None when
     every changed file was skipped, so the caller can refuse the pull
     instead of serving an empty archive as a clean sync. Returns None when
@@ -1492,7 +1492,7 @@ def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | st
                 skipped += 1
                 continue
             data, mtime = result
-            # UTC, matched by calendar.timegm on extract  a TZ difference
+            # UTC, matched by calendar.timegm on extract, a TZ difference
             # between the GET and PUT containers must not shift mtimes and
             # silently break the newer-file guard.
             info = zipfile.ZipInfo(
@@ -1528,7 +1528,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
     Returns (written, skipped, failed), or an error string for a bad archive.
     Existing files newer than their archive member are skipped so a restore
     can never roll back saves made since the archive was taken. A per-file
-    write failure doesn't abort the restore  remaining members still land,
+    write failure doesn't abort the restore: remaining members still land,
     the failure is counted, and the handler reports it; the mtime guard
     makes a retry of the same archive idempotent."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
@@ -1567,7 +1567,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
             except OSError as exc:
-                log.warning("save-file: could not restore %s  %s", info.filename, exc)
+                log.warning("save-file: could not restore %s: %s", info.filename, exc)
                 failed += 1
                 continue
             written += 1
@@ -1579,7 +1579,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
 # replaces the ENTIRE Slot-1 folder card (superblock + every game folder) as one
 # host-independent image, so a user's card can be hydrated onto any pooled
 # container. GET evacuates the whole card; PUT wipes Slot 1 and lays the card
-# back down. Only Slot 1 is ever touched  Slot 2 is never synced.
+# back down. Only Slot 1 is ever touched. Slot 2 is never synced.
 
 
 # Serializes whole-card operations: os.getpid() is constant in this process,
@@ -1652,7 +1652,7 @@ def _build_memory_card_archive() -> bytes | None | str:
             try:
                 zf.write(p, p.relative_to(path).as_posix())
             except OSError as exc:
-                log.warning("memory-card: could not read %s  %s", p, exc)
+                log.warning("memory-card: could not read %s: %s", p, exc)
     return buf.getvalue()
 
 
@@ -1669,7 +1669,7 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
         # This container is misprovisioned: hydrate needs a Folder card in slot 1.
         # Log loudly so the offending host surfaces in monitoring, then refuse.
         log.warning(
-            "memory-card: hydrate rejected on %s  slot 1 is a File card at %s",
+            "memory-card: hydrate rejected on %s, slot 1 is a File card at %s",
             _socket.gethostname(),
             path,
         )
@@ -1716,10 +1716,10 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
                 try:
                     os.replace(backup, path)
                 except OSError:
-                    # The backup is now the only surviving copy of the card
+                    # The backup is now the only surviving copy of the card:
                     # leave it on disk for manual recovery instead of deleting it.
                     log.error(
-                        "memory-card: could not restore card to %s  old card preserved at %s",
+                        "memory-card: could not restore card to %s, old card preserved at %s",
                         path,
                         backup,
                     )
@@ -1770,7 +1770,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> dict | None:
         """Parse the JSON request body. Returns {} for an absent body. Sends
         the error response itself and returns None when the body is oversized
-        or not a JSON object  callers must bail out on None."""
+        or not a JSON object, callers must bail out on None."""
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -1801,7 +1801,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if slot == 0:
             slot = SAVE_SLOT
         if not (1 <= slot <= 10):
-            self._send_json(400, {"error": "slot must be 0–10"})
+            self._send_json(400, {"error": "slot must be 0-10"})
             return
 
         # Block while a save is being written so the caller never receives a
@@ -1815,7 +1815,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "no state file for slot", "slot": slot})
             return
         try:
-            # Size-check via stat before reading  never hold an oversized
+            # Size-check via stat before reading, never hold an oversized
             # file in memory just to refuse it.
             if state_path.stat().st_size > STATE_FILE_MAX_BYTES:
                 self._send_json(413, {"error": "state file exceeds size limit"})
@@ -1896,7 +1896,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         written, skipped, failed = result
         if failed:
             log.warning(
-                "save-file: restore incomplete  %d written, %d skipped, %d failed",
+                "save-file: restore incomplete: %d written, %d skipped, %d failed",
                 written, skipped, failed,
             )
             self._send_json(500, {
@@ -1904,7 +1904,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "written": written, "skipped": skipped, "failed": failed,
             })
             return
-        log.info("save-file: restored archive  %d written, %d skipped", written, skipped)
+        log.info("save-file: restored archive: %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
     def _get_memory_card(self):
@@ -1967,7 +1967,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         # Claim for the whole replace. Re-checks "no game running" atomically,
         # closing the TOCTOU against a /launch that lands during the body read
-        # above  POST /launch refuses while this claim is held.
+        # above. POST /launch refuses while this claim is held.
         if not _claim_card_op():
             self._send_json(
                 409, {"error": "cannot replace memory card while a game is running or launching"}
@@ -1987,7 +1987,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": result})
             return
         (written,) = result
-        log.info("memory-card: replaced slot-1 card  %d files", written)
+        log.info("memory-card: replaced slot-1 card: %d files", written)
         self._send_json(200, {"status": "ok", "written": written})
 
     def do_PUT(self):
@@ -2005,7 +2005,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Basename only  the filename came from a previous GET and is written
+        # Basename only: the filename came from a previous GET and is written
         # back verbatim so PCSX2 recognises the slot; path parts are rejected.
         raw_name = parse_qs(parsed.query).get("filename", [""])[0]
         filename = Path(raw_name).name
@@ -2114,7 +2114,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(slot, int) or not (0 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 0–10"})
+                self._send_json(400, {"error": "slot must be 0-10"})
                 return
             # Slot 0 is a legacy value meaning "use the default autosave slot".
             if slot == 0:
@@ -2127,12 +2127,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     with _session_lock:
                         _session["save_in_progress"] = False
                 if not ok:
-                    log.warning("streaming: save state failed (slot %d)  relaunching dashboard anyway", slot)
+                    log.warning("streaming: save state failed (slot %d), relaunching dashboard anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
                 # Save-and-exit releases the session, so the stream token must
                 # die with it: a discovered host is otherwise still usable.
                 _clear_stream_token()
-                # Relaunch to dashboard regardless of save result  PCSX2 is already dead.
+                # Relaunch to dashboard regardless of save result, PCSX2 is already dead.
                 Thread(target=_relaunch_dashboard, daemon=True).start()
             else:
                 # Clear visible session state synchronously so that callers
@@ -2154,8 +2154,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         with _session_lock:
                             _session["save_in_progress"] = False
                     if not ok:
-                        log.warning("streaming: save state failed (slot %d)  relaunching dashboard anyway", s)
-                    # Relaunch to dashboard regardless of save result  PCSX2 is already dead.
+                        log.warning("streaming: save state failed (slot %d), relaunching dashboard anyway", s)
+                    # Relaunch to dashboard regardless of save result, PCSX2 is already dead.
                     _relaunch_dashboard()
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 self._send_json(200, {"status": "queued", "slot": slot})
@@ -2167,7 +2167,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
-                self._send_json(400, {"error": "level must be an integer 0–100"})
+                self._send_json(400, {"error": "level must be an integer 0-100"})
                 return
             result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
@@ -2212,7 +2212,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–10"})
+                self._send_json(400, {"error": "slot must be 1-10"})
                 return
             def _bg_save(s):
                 try:
@@ -2236,7 +2236,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
-                self._send_json(400, {"error": "slot must be 1–10"})
+                self._send_json(400, {"error": "slot must be 1-10"})
                 return
             ok = _load_state(slot)
             if ok:
@@ -2295,11 +2295,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if load_slot is not None and (
             not isinstance(load_slot, int) or not (1 <= load_slot <= 10)
         ):
-            self._send_json(400, {"error": "load_slot must be 1–10"})
+            self._send_json(400, {"error": "load_slot must be 1-10"})
             return
 
         # Check save_in_progress and claim launch_in_progress in the same lock
-        # acquisition  checking them separately lets a save start in the gap,
+        # acquisition: checking them separately lets a save start in the gap,
         # and the launch would then kill PCSX2 mid-savestate.
         with _session_lock:
             if _session["save_in_progress"]:
@@ -2333,7 +2333,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Same claim as POST /launch  a soft reset interleaved with a live
+        # Same claim as POST /launch, a soft reset interleaved with a live
         # launch would run two kill+start sequences against one session.
         if not _claim_launch():
             self._send_json(409, {"error": "launch already in progress"})
@@ -2351,7 +2351,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     """Stop the HTTP listener, finish any in-flight save, then kill PCSX2.
     Triggered on SIGTERM/SIGINT so `systemctl stop` doesn't drop a save mid-write."""
-    log.info("Received signal %d  beginning graceful shutdown", signum)
+    log.info("Received signal %d, beginning graceful shutdown", signum)
     # Stop accepting new requests immediately so /save-and-exit can't race us.
     Thread(target=server.shutdown, daemon=True).start()
 
@@ -2365,14 +2365,14 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight save did not complete within %.1fs  killing PCSX2 anyway", save_wait)
+        log.warning("Shutdown: in-flight save did not complete within %.1fs, killing PCSX2 anyway", save_wait)
 
     _kill_pcsx2()
     log.info("Shutdown complete")
 
 
 def main():
-    log.info("Broker starting  waiting for desktop X display...")
+    log.info("Broker starting, waiting for desktop X display...")
     display = _wait_for_x_display(timeout=30.0)
     if display is None:
         log.error("No live X display appeared within 30s; pcsx2-qt will likely fail to launch")
@@ -2392,7 +2392,7 @@ def main():
     if result.returncode == 0:
         log.info("Killed stale pcsx2-qt instance(s) on startup.")
         if not _wait_for_no_pcsx2(timeout=3.0):
-            log.warning("Stale pcsx2-qt instance still running after SIGKILL  OS may be slow")
+            log.warning("Stale pcsx2-qt instance still running after SIGKILL, OS may be slow")
 
     _patch_ini()
     _launch_pcsx2_internal(None)
@@ -2405,7 +2405,7 @@ def main():
     if SECRET:
         log.info("Shared secret auth enabled")
     else:
-        log.warning("BROKER_SECRET not set  all POST/DELETE endpoints are unauthenticated")
+        log.warning("BROKER_SECRET not set, all POST/DELETE endpoints are unauthenticated")
 
     # Install a single handler for both SIGTERM (systemd stop) and SIGINT
     # (Ctrl-C). We intentionally don't use server.serve_forever()'s default

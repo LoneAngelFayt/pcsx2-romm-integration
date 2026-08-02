@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for broker.py.
 
-Development-only — excluded from the Docker image via .dockerignore. Run from
+Development-only, excluded from the Docker image via .dockerignore. Run from
 the repo root with the stdlib runner (no pytest, no dependencies):
 
     python3 -m unittest discover -s tests -v
