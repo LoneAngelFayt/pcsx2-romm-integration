@@ -119,6 +119,13 @@ fi
 # The broker exempts /verify from its shared secret because nginx cannot forward
 # that secret and the stream token is the credential.
 #
+# The gate is injected unconditionally, but ENFORCEMENT is the broker's call:
+# /verify admits everything when STREAM_GATE=off, which is the default while
+# RomM has no way to send the token. That split is deliberate. This file writes
+# into the container's writable layer behind the marker grep below, so a mode
+# decided here would need a --force-recreate in each direction, while a mode
+# decided in the broker is a restart.
+#
 # EVERY server block is gated, not just the 3001 SSL vhost RomM points at. The
 # base image ships a second, identical plain-HTTP vhost on 3000 (same /websocket
 # proxy to selkies, same /files alias of /config/Desktop), so anchoring this on

@@ -45,6 +45,7 @@ services:
       - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
       - BROKER_SECRET=your_secret_here
       - ROM_ROOT=/romm/library
+      - STREAM_GATE=off        # see Security; 'token' once RomM sends the token
     ports:
       - 8000:8000   # broker API
     volumes:
@@ -124,6 +125,7 @@ Save states don't care about any of this. The requirement is only for memory-car
 | `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for PCSX2, which runs as `abc` and has to overwrite them later. |
 | `STREAM_TOKEN_TTL` | `43200.0` | Idle seconds before a stream token stops working. Every admitted request slides it forward, so it only fires on a session nobody is watching. Stops an abandoned session leaving the stream gate open forever. |
 | `STREAM_TOKEN_GRACE` | `120.0` | How long the previous token keeps working after a relaunch mints a new one, so an already-open tab is not cut off mid-navigation. |
+| `STREAM_GATE` | `off` | `token` enforces the stream gate: the desktop on 3000/3001 admits only requests carrying the token `POST /launch` mints. `off` admits everything. Defaults to `off` because released RomM cannot send that token yet, see [Security](#security). |
 
 ## API
 
@@ -214,7 +216,11 @@ Two credentials, guarding two different things.
 
 **`BROKER_SECRET` guards the API on port 8000.** Sent as `X-Broker-Secret`, compared in constant time. `GET /health` and `GET /verify` are deliberately exempt: `/health` so it works as a container healthcheck, `/verify` because nginx's `auth_request` cannot forward the secret and the stream token is itself the credential there.
 
-**The stream token guards the desktop on 3000/3001.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy — direct plain-HTTP browsing to it now fails closed.
+**The stream token guards the desktop on 3000/3001, when you turn it on.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy: direct plain-HTTP browsing to it fails closed.
+
+**The gate ships off, and that is a real hole.** With `STREAM_GATE=off`, anyone who can reach port 3000 or 3001 gets the interactive desktop with your ROM library browsable at `/files`, no credential asked for. It defaults to off because RomM cannot send the token yet. The streaming feature people are running is [rommapp/romm#3211](https://github.com/rommapp/romm/pull/3211), which is merged and hands the browser your configured `host` with nothing appended; the half that carries the token into the iframe URL is [rommapp/romm#3856](https://github.com/rommapp/romm/pull/3856), still open. Enforcing against a client that cannot comply is not a gate, it is a black stream: nginx refuses the document, every asset and the WebSocket upgrade alike, with nothing on screen to say why.
+
+So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and restart. No recreate is needed, because enforcement is decided in the broker and the nginx gate is already injected either way. The broker logs which mode it is in at startup, and `GET /status` reports it as `stream_gate`.
 
 **Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else. The broker logs a warning at startup when it is unset.
 
