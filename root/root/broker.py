@@ -29,6 +29,11 @@ from urllib.parse import parse_qs, urlparse
 
 PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
+# The secret is compared as bytes, never as str: hmac.compare_digest refuses a
+# str with non-ASCII characters, so a UTF-8 BROKER_SECRET would raise inside
+# every _check_secret and answer 500 to every request. Encoding once here keeps
+# the comparison total for any secret an operator can set.
+_SECRET_BYTES = SECRET.encode("utf-8")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
 # JSON request bodies are tiny (a rom_path, a slot number); anything larger
@@ -1812,6 +1817,18 @@ def _redact_uri(uri: str) -> str:
     return re.sub(r"(stream_token=)[^&]*", r"\1REDACTED", uri)
 
 
+def _header_token(value: str, fallback: str) -> str:
+    """Reduce `value` to something safe to send as an HTTP header value.
+
+    Header values are latin-1 and http.server writes them through without
+    validating, so a CR or LF reaching send_header splits the response. Both
+    callers pass names taken off the filesystem, where those bytes are legal
+    in a filename, so the filter belongs here rather than at each call site.
+    """
+    safe = "".join(c for c in value if c.isascii() and c.isprintable()).strip()
+    return safe or fallback
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -1820,9 +1837,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _check_secret(self) -> bool:
         if not SECRET:
             return True
+        # latin-1 is how http.server decoded the header, so encoding it back
+        # recovers exactly the bytes that arrived on the wire, which is what
+        # _SECRET_BYTES is comparable against.
         return hmac.compare_digest(
-            self.headers.get("X-Broker-Secret", ""),
-            SECRET,
+            self.headers.get("X-Broker-Secret", "").encode("latin-1", "replace"),
+            _SECRET_BYTES,
         )
 
     def _verify_stream(self) -> None:
@@ -1967,7 +1987,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("X-State-Filename", state_path.name)
+        self.send_header(
+            "X-State-Filename", _header_token(state_path.name, "state.p2s")
+        )
         self.end_headers()
         self.wfile.write(content)
         log.info("state-file: served %s (%d bytes)", state_path.name, len(content))
@@ -1996,9 +2018,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
         # Header values must be latin-1; ROM stems can be anything.
-        safe_name = "".join(
-            c for c in (rom_name or "pcsx2") if c.isascii() and c.isprintable()
-        ).strip() or "pcsx2"
+        safe_name = _header_token(rom_name or "pcsx2", "pcsx2")
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(archive)))
@@ -2154,6 +2174,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         filename = Path(raw_name).name
         if not filename or filename.startswith(".") or not filename.endswith(".p2s"):
             self._send_json(400, {"error": "filename must be a .p2s basename"})
+            return
+        # CR and LF are legal in a Linux filename, so without this a stored name
+        # carrying them would split the response when GET /state-file echoes it
+        # back as X-State-Filename. _header_token sanitises that emit too; this
+        # refuses the name outright rather than silently storing a mangled one.
+        if filename != _header_token(filename, ""):
+            self._send_json(400, {"error": "filename must be printable ASCII"})
             return
 
         try:

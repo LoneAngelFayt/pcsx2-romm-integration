@@ -945,5 +945,145 @@ class ErrorLoggingTests(unittest.TestCase):
         self.assertEqual(broker._redact_uri("/state-file?slot=3"), "/state-file?slot=3")
 
 
+class HeaderTokenTests(unittest.TestCase):
+    """Header values go out unvalidated by http.server, so a CR or LF in a
+    filename would split the response. _header_token is the one filter."""
+
+    def test_crlf_is_stripped(self):
+        out = broker._header_token("evil\r\nX-Injected: yes.p2s", "state.p2s")
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\n", out)
+
+    def test_non_ascii_is_stripped(self):
+        self.assertEqual(broker._header_token("Pokémon.p2s", "x"), "Pokmon.p2s")
+
+    def test_a_name_with_nothing_left_falls_back(self):
+        self.assertEqual(broker._header_token("\r\n\t", "state.p2s"), "state.p2s")
+
+    def test_an_ordinary_name_survives_intact(self):
+        self.assertEqual(
+            broker._header_token("SLUS-21295 (A1B2C3D4).01.p2s", "x"),
+            "SLUS-21295 (A1B2C3D4).01.p2s",
+        )
+
+
+class _FakePutHandler(broker.BrokerHandler):
+    """Drives do_PUT without a socket."""
+
+    def __init__(self, path, body=b""):
+        self.path = path
+        self.rfile = io.BytesIO(body)
+        self.headers = {"Content-Length": str(len(body))}
+        self.sent = None
+        self.command = "PUT"
+        self.client_address = ("127.0.0.1", 0)
+
+    def _check_secret(self):
+        return True
+
+    def _send_json(self, code, body, headers=None):
+        self.sent = (code, body)
+
+
+class _FakeGetHandler(broker.BrokerHandler):
+    """Drives do_GET without a socket, capturing headers rather than writing."""
+
+    def __init__(self, path):
+        self.path = path
+        self.headers = {}
+        self.sent = None
+        self.command = "GET"
+        self.client_address = ("127.0.0.1", 0)
+        self.wfile = io.BytesIO()
+        self.sent_headers = []
+        self.response_code = None
+
+    def _check_secret(self):
+        return True
+
+    def _send_json(self, code, body, headers=None):
+        self.sent = (code, body)
+
+    def send_response(self, code):
+        self.response_code = code
+
+    def send_header(self, name, value):
+        self.sent_headers.append((name, value))
+
+    def end_headers(self):
+        pass
+
+
+class StateFileNameTests(unittest.TestCase):
+    """PUT refuses a name that could split a header, and GET sanitises the
+    name it echoes back in case one predates the PUT-side check."""
+
+    def setUp(self):
+        _reset_session()
+        self.addCleanup(_reset_session)
+
+    def test_crlf_filename_is_refused_by_put(self):
+        h = _FakePutHandler("/state-file?filename=a%0d%0aX-Injected:+yes.p2s", b"x")
+        h.do_PUT()
+        code, body = h.sent
+        self.assertEqual(code, 400)
+        self.assertIn("printable ASCII", body["error"])
+
+    def test_an_ordinary_filename_is_still_stored(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(broker, "SSTATE_DIR", Path(td)), \
+                 mock.patch.object(broker.os, "chown"):
+                h = _FakePutHandler("/state-file?filename=SLUS-21295.01.p2s", b"data")
+                h.do_PUT()
+            self.assertEqual(h.sent[0], 200)
+            self.assertEqual((Path(td) / "SLUS-21295.01.p2s").read_bytes(), b"data")
+
+    def test_get_sanitises_a_crlf_name_already_on_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "a\r\nX-Injected: yes.01.p2s").write_bytes(b"state")
+            with mock.patch.object(broker, "SSTATE_DIR", Path(td)):
+                h = _FakeGetHandler("/state-file?slot=1")
+                h.do_GET()
+        self.assertEqual(h.response_code, 200)
+        emitted = dict(h.sent_headers)["X-State-Filename"]
+        self.assertNotIn("\r", emitted)
+        self.assertNotIn("\n", emitted)
+
+
+class SecretCheckTests(unittest.TestCase):
+    """The shared secret is compared as bytes: hmac.compare_digest rejects a
+    str carrying non-ASCII, so a UTF-8 BROKER_SECRET used to raise inside every
+    _check_secret and answer 500 to every request rather than 403."""
+
+    class _Req:
+        def __init__(self, header):
+            self.headers = {} if header is None else {"X-Broker-Secret": header}
+
+    def _check(self, secret, sent):
+        with mock.patch.object(broker, "SECRET", secret), \
+             mock.patch.object(broker, "_SECRET_BYTES", secret.encode("utf-8")):
+            return broker.BrokerHandler._check_secret(self._Req(sent))
+
+    def test_utf8_secret_accepts_the_bytes_that_arrive_on_the_wire(self):
+        secret = "pässwort"
+        # http.server hands header values back latin-1-decoded, so this is what
+        # _check_secret actually sees when a client sends the UTF-8 secret.
+        on_the_wire = secret.encode("utf-8").decode("latin-1")
+        self.assertTrue(self._check(secret, on_the_wire))
+
+    def test_utf8_secret_rejects_a_wrong_one_rather_than_raising(self):
+        self.assertFalse(self._check("pässwort", "nope"))
+
+    def test_ascii_secret_still_matches(self):
+        self.assertTrue(self._check("plain-secret", "plain-secret"))
+
+    def test_a_missing_header_is_rejected(self):
+        self.assertFalse(self._check("plain-secret", None))
+
+    def test_an_unset_secret_accepts_everything(self):
+        with mock.patch.object(broker, "SECRET", ""):
+            self.assertTrue(broker.BrokerHandler._check_secret(self._Req(None)))
+
+
 if __name__ == "__main__":
     unittest.main()

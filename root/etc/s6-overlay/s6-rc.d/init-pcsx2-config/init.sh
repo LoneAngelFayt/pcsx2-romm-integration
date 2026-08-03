@@ -110,47 +110,72 @@ else
     echo "[broker-mod] ERROR: selkies input_handler.py not found under /lsiopy, /usr/lib, /usr/local/lib, /opt or /config/.local, so neither the gamepad EOF fix nor the log-level patch was applied"
 fi
 
-# Gate the browser-facing stream with nginx auth_request. The 3001 SSL vhost is
-# the host RomM loads in the iframe; without this, anyone who learns the address
-# gets an interactive desktop with the ROM library mounted, since RomM's auth
-# never sits on this socket. auth_request sends every 3001 request to the
-# broker's /verify, which checks the session-bound stream token RomM appends to
-# the iframe URL and, on the first (query-token) hit, hands back a stream_sid
-# cookie that carries every later asset and the WebSocket upgrade. Anchored on
-# ssl_certificate_key, which appears only in the 3001 server block, so the plain
-# 3000 vhost is untouched. The broker exempts /verify from its shared secret
-# because nginx cannot forward that secret and the stream token is the credential.
+# Gate the browser-facing stream with nginx auth_request. Without this, anyone
+# who learns the address gets an interactive desktop with the ROM library
+# mounted, since RomM's auth never sits on this socket. auth_request sends every
+# request to the broker's /verify, which checks the session-bound stream token
+# RomM appends to the iframe URL and, on the first (query-token) hit, hands back
+# a stream_sid cookie that carries every later asset and the WebSocket upgrade.
+# The broker exempts /verify from its shared secret because nginx cannot forward
+# that secret and the stream token is the credential.
+#
+# EVERY server block is gated, not just the 3001 SSL vhost RomM points at. The
+# base image ships a second, identical plain-HTTP vhost on 3000 (same /websocket
+# proxy to selkies, same /files alias of /config/Desktop), so anchoring this on
+# ssl_certificate_key left a complete bypass of the gate one port number away,
+# and publishing 3000 is exactly what the base image's own docs tell you to do.
+# Note that stream_sid is a Secure cookie: reaching 3000 directly over plain
+# HTTP admits the query token but the cookie will not stick, so 3000 only works
+# behind a proxy that terminates TLS. That is the supported shape; unproxied
+# plain-HTTP 3000 is not, and now fails closed instead of serving the desktop.
+#
+# /50x.html is exempted because it is the error_page target: left gated, a
+# broker outage makes each request bounce between the 500 and its own gated
+# error page until nginx's internal-redirect limit trips.
 NGINX_SITE="/etc/nginx/sites-available/default"
 if [ -f "$NGINX_SITE" ]; then
     if grep -q "RomM stream gate" "$NGINX_SITE"; then
         echo "[broker-mod] nginx stream gate already applied."
     else
-        awk '
-          { print }
-          /ssl_certificate_key/ && !injected {
+        awk -v bport="${BROKER_PORT:-8000}" '
+          /^[[:space:]]*server[[:space:]]*\{/ {
+            print
             print "  # ── RomM stream gate (pcsx2-broker-mod) ──"
             print "  auth_request /_stream_auth;"
             print "  auth_request_set $stream_set_cookie $upstream_http_set_cookie;"
             print "  add_header Set-Cookie $stream_set_cookie;"
+            print "  add_header Referrer-Policy \"same-origin\" always;"
             print "  location = /_stream_auth {"
             print "    internal;"
             print "    auth_request off;"
-            print "    proxy_pass http://127.0.0.1:8000/verify;"
+            print "    proxy_pass http://127.0.0.1:" bport "/verify;"
             print "    proxy_pass_request_body off;"
             print "    proxy_set_header Content-Length \"\";"
             print "    proxy_set_header X-Original-URI $request_uri;"
             print "  }"
-            injected = 1
+            next
           }
-        ' "$NGINX_SITE" > "$NGINX_SITE.tmp" && mv "$NGINX_SITE.tmp" "$NGINX_SITE"
-        if grep -q "RomM stream gate" "$NGINX_SITE"; then
-            echo "[broker-mod] Applied nginx stream gate to 3001 vhost."
+          /^[[:space:]]*location[[:space:]]*=[[:space:]]*\/50x\.html[[:space:]]*\{/ {
+            print
+            print "    auth_request off;"
+            next
+          }
+          { print }
+        ' "$NGINX_SITE" > "$NGINX_SITE.tmp"
+        gated=$(grep -c "RomM stream gate" "$NGINX_SITE.tmp" 2>/dev/null)
+        [ -n "$gated" ] || gated=0
+        if [ "$gated" -gt 0 ]; then
+            mv "$NGINX_SITE.tmp" "$NGINX_SITE"
+            echo "[broker-mod] Applied nginx stream gate to $gated vhost(s)."
+            if [ "$gated" -lt 2 ]; then
+                echo "[broker-mod] WARNING: only $gated vhost gated; the base image ships two (3000 and 3001). Any other listener is serving the desktop ungated."
+            fi
             if ! nginx -t 2>/dev/null; then
                 echo "[broker-mod] WARNING: nginx -t failed now (ssl cert may not exist yet at init); nginx revalidates at start."
             fi
         else
             rm -f "$NGINX_SITE.tmp"
-            echo "[broker-mod] ERROR: nginx stream gate not applied (ssl_certificate_key anchor missing; base image may have changed)."
+            echo "[broker-mod] ERROR: nginx stream gate not applied (no 'server {' block matched; base image may have changed)."
         fi
     fi
 else

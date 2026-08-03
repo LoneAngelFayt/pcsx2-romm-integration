@@ -108,7 +108,7 @@ Save states don't care about any of this. The requirement is only for memory-car
 
 | Variable | Default | What it does |
 |---|---|---|
-| `BROKER_SECRET` | *(none)* | Shared secret, sent as `X-Broker-Secret`. Unset means every request is accepted, which is not safe on a shared network. |
+| `BROKER_SECRET` | *(none)* | Shared secret, sent as `X-Broker-Secret`. Unset means every request is accepted. Debug-only, see [Security](#security). |
 | `BROKER_PORT` | `8000` | Port the broker listens on. |
 | `ROM_ROOT` | `/romm/library` | Where ROMs are mounted. A `rom_path` outside this is rejected. |
 | `SAVE_SLOT` | `10` | Slot `/save-and-exit` uses when none is given. 10 as autosave leaves 1-9 for the player. |
@@ -208,6 +208,18 @@ State files are named `{SERIAL} ({CRC}).{slot:02d}.p2s`, which is PCSX2's own sc
 
 It is refused while a game is running or a launch is in flight, because PCSX2 holds the card open and swapping it mid-game corrupts it. Hydrate before launch or after exit. `POST /launch` is refused for the duration too, so a launch can't slip in mid-replace. Dashboard crash recovery is *not* blocked, since the gameless dashboard never opens a card and the swap is atomic either way.
 
+## Security
+
+Two credentials, guarding two different things.
+
+**`BROKER_SECRET` guards the API on port 8000.** Sent as `X-Broker-Secret`, compared in constant time. `GET /health` and `GET /verify` are deliberately exempt: `/health` so it works as a container healthcheck, `/verify` because nginx's `auth_request` cannot forward the secret and the stream token is itself the credential there.
+
+**The stream token guards the desktop on 3000/3001.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy — direct plain-HTTP browsing to it now fails closed.
+
+**Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else. The broker logs a warning at startup when it is unset.
+
+Port 8000 is plain HTTP, so the secret crosses the network in the clear. Keep the broker on an internal network, or put TLS in front of it.
+
 ## Troubleshooting
 
 **Reading the logs.** Every request the broker refuses or fails is logged to stdout, not only returned as JSON, so `docker logs pcsx2` is enough to see what went wrong without turning on `DEBUG`. The shape is `HTTP <code> <method> <path> from <caller>: <reason>`. A `WARNING` is a caller-side rejection (bad slot, no game running, a claim already held); an `ERROR` is a broker-side fault (pactl failed, a state file that could not be written) and always deserves attention. An unhandled crash inside a handler logs a full traceback and still answers `500 internal broker error` rather than dropping the connection. Stream tokens are redacted from logged URLs, so log output is safe to paste into a bug report.
@@ -238,7 +250,9 @@ The usual cause is the hardware encoder: Selkies routes `x264enc` through VAAPI 
 
 Confirm it took with `docker logs pcsx2 | grep -E "VAAPI|CPU Software"`. If it still cycles, drop to `SELKIES_ENCODER=jpeg` to skip H.264 entirely, at a real cost in bandwidth and sharpness.
 
-**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: either the mod's init never patched nginx (`docker logs pcsx2 | grep broker-mod`), or your reverse proxy is reaching the ungated plain-HTTP vhost on port 3000 instead of the SSL vhost on 3001. Point it at 3001 and do not publish 3000: the gate is the only thing standing between the ROM library and anyone who finds the address.
+**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: the mod's init never patched nginx. Check `docker logs pcsx2 | grep broker-mod` for the "Applied nginx stream gate to N vhost(s)" line, which should say 2.
+
+**A stream that 403s on every asset over plain HTTP.** The `stream_sid` cookie is `Secure`, so a browser will not store it on an unencrypted origin. The query token admits the first request and everything after it is refused. Reach the container over TLS: either port 3001 directly, or port 3000 behind a reverse proxy that terminates TLS. Plain-HTTP 3000 straight to a browser is not a supported shape and now fails closed rather than serving an ungated desktop.
 
 ## Development
 
@@ -250,7 +264,7 @@ python3 -m unittest discover -s tests -v
 
 CI runs the same tests under pytest, plus `ruff check .` against the shared [ruff.toml](ruff.toml). `tests/` is excluded from the image by `.dockerignore` and never ships.
 
-The suite covers what can be tested without a running emulator: save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching, ROM path resolution, and the session state machine (crash-loop limiter, launch and card-op claims, deferred `load_slot` generation checks). Anything needing a real X display, PINE socket, or pcsx2-qt process is out of scope on purpose, because it is only provable on a live container.
+The suite covers what can be tested without a running emulator: save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching, ROM path resolution, the session state machine (crash-loop limiter, launch and card-op claims, deferred `load_slot` generation checks), the stream-token gate decision, and the header/secret handling that keeps a filename off the response line and a UTF-8 secret out of a 500. Anything needing a real X display, PINE socket, or pcsx2-qt process is out of scope on purpose, because it is only provable on a live container.
 
 **Init ordering matters more than it looks.** The mod ships two s6 oneshots. `init-pcsx2-config` rewrites files that base-image services read exactly once at startup (selkies' `input_handler.py`, the nginx site config, labwc's autostart), so `init-services` is made to depend on it and the whole service stack waits. Drop that edge and the patches still land on disk while changing nothing about the processes already running, which fails silently: the log says "Applied nginx stream gate" and the live nginx has no gate. Keep that script fast and offline. `init-pcsx2-deps` holds the slow networked work (apt, `patches.zip`) and only `svc-broker` waits for it, so a GitHub timeout cannot stall the stream.
 
