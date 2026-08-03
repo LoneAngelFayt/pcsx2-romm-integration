@@ -123,8 +123,9 @@ fi
 # /verify admits everything when STREAM_GATE=off, which is the default while
 # RomM has no way to send the token. That split is deliberate. This file writes
 # into the container's writable layer behind the marker grep below, so a mode
-# decided here would need a --force-recreate in each direction, while a mode
-# decided in the broker is a restart.
+# decided here would need a --force-recreate in each direction. Decided in the
+# broker it is one variable, and the marker grep makes this script idempotent,
+# so the fresh layer a changed variable brings costs nothing to re-patch.
 #
 # EVERY server block is gated, not just the 3001 SSL vhost RomM points at. The
 # base image ships a second, identical plain-HTTP vhost on 3000 (same /websocket

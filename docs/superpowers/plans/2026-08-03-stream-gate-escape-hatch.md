@@ -4,7 +4,7 @@
 
 **Goal:** Add a `STREAM_GATE` operator switch, defaulted to `off`, that stops the nginx stream gate from locking out every user of released RomM.
 
-**Architecture:** Enforcement becomes a broker-side decision rather than an nginx-side one. `_verify_stream_decision` short-circuits to a 200 when the gate is off; the nginx `auth_request` injection is left untouched and still gates every vhost, so switching modes is a container restart instead of a `--force-recreate` in each direction. The token machinery (mint, report, clear, TTL, grace) keeps running unchanged, so turning the gate back on when rommapp/romm#3856 merges is one environment variable.
+**Architecture:** Enforcement becomes a broker-side decision rather than an nginx-side one. `_verify_stream_decision` short-circuits to a 200 when the gate is off; the nginx `auth_request` injection is left untouched and still gates every vhost, so switching modes is one environment variable instead of a `--force-recreate` in each direction. The token machinery (mint, report, clear, TTL, grace) keeps running unchanged, so turning the gate back on when rommapp/romm#3856 merges is one environment variable.
 
 **Tech Stack:** Python 3, standard library only (no third party imports in `broker.py`, deliberately). Tests are `unittest`, not pytest. Lint is `ruff`. Shell is POSIX `sh` for the s6 init scripts.
 
@@ -332,7 +332,7 @@ is live for everyone on the published image.
 The decision is made here rather than in the nginx config on purpose. As
 1736c84 recorded, that patch lands in the container's writable layer
 behind its own marker grep, so a gate decided there needs a recreate in
-each direction; decided in the broker, switching modes is a restart.
+each direction; decided in the broker, switching modes is one variable.
 
 The token machinery is untouched: /launch still mints, /status still
 reports, release still clears, and the TTL and grace still tick. Only
@@ -534,7 +534,13 @@ In `README.md`, replace the paragraph beginning `**The stream token guards the d
 
 **The gate ships off, and that is a real hole.** With `STREAM_GATE=off`, anyone who can reach port 3000 or 3001 gets the interactive desktop with your ROM library browsable at `/files`, no credential asked for. It defaults to off because RomM cannot send the token yet. The streaming feature people are running is [rommapp/romm#3211](https://github.com/rommapp/romm/pull/3211), which is merged and hands the browser your configured `host` with nothing appended; the half that carries the token into the iframe URL is [rommapp/romm#3856](https://github.com/rommapp/romm/pull/3856), still open. Enforcing against a client that cannot comply is not a gate, it is a black stream: nginx refuses the document, every asset and the WebSocket upgrade alike, with nothing on screen to say why.
 
-So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and restart. No recreate is needed, because enforcement is decided in the broker and the nginx gate is already injected either way. The broker logs which mode it is in at startup, and `GET /status` reports it as `stream_gate`.
+So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and bring the container back up:
+
+```bash
+docker compose up -d pcsx2
+```
+
+Use `up -d`, not `restart`. Compose bakes the environment in at create time, so `docker compose restart` replays the old value and the gate silently stays off. The changed variable is enough on its own to recreate the container; no `--force-recreate` is needed, because enforcement is decided in the broker rather than in the nginx config, and the init re-injects the same gate on the fresh layer either way. Confirm it took: the broker names the mode in its startup log, and `GET /status` reports it as `stream_gate`.
 ```
 
 - [ ] **Step 4: Correct the init.sh comment**
@@ -547,8 +553,9 @@ In `root/etc/s6-overlay/s6-rc.d/init-pcsx2-config/init.sh`, the block at line 11
 # /verify admits everything when STREAM_GATE=off, which is the default while
 # RomM has no way to send the token. That split is deliberate. This file writes
 # into the container's writable layer behind the marker grep below, so a mode
-# decided here would need a --force-recreate in each direction, while a mode
-# decided in the broker is a restart.
+# decided here would need a --force-recreate in each direction. Decided in the
+# broker it is one variable, and the marker grep makes this script idempotent,
+# so the fresh layer a changed variable brings costs nothing to re-patch.
 ```
 
 - [ ] **Step 5: Verify the prose**
@@ -584,12 +591,12 @@ library at /files with no credential.
 
 It also names why, with both upstream PRs linked, because an operator
 weighing that risk needs to know it ends when rommapp/romm#3856 merges
-and that turning the gate on is one variable and a restart.
+and that turning the gate on is one variable and an `up -d`.
 
 The init.sh comment block claimed unconditional enforcement too. It now
 records the split: the gate is always injected, the broker decides
 whether to enforce, and that is what keeps a mode switch from needing a
-recreate in each direction."
+--force-recreate in each direction."
 ```
 
 ---
@@ -619,7 +626,7 @@ The one thing the suite cannot prove is the container behavior, which matches th
 2. `podman logs pcsx2 | grep -i "stream gate"` shows the `STREAM_GATE=off` warning.
 3. `curl -sk -o /dev/null -w '%{http_code}\n' https://<host>:3001/` returns `200`, not `403`. This is the lockout being gone, and it is the whole point of the change.
 4. `curl -s -H "X-Broker-Secret: $SECRET" http://<host>:8000/status | grep stream_gate` reports `"stream_gate": "off"`.
-5. Set `STREAM_GATE=token`, `restart` (not recreate), and confirm the same `curl` in step 3 now returns `403` while the startup log says the gate is enforced. A restart being enough is the design claim worth checking directly.
+5. Set `STREAM_GATE=token`, bring the container back up with `up -d` (not `restart`, which replays the environment baked in at create time and would leave the old mode live), and confirm the same `curl` in step 3 now returns `403` while the startup log says the gate is enforced. One variable being enough, with no config-file surgery and no `--force-recreate`, is the design claim worth checking directly.
 
 ## When rommapp/romm#3856 merges
 

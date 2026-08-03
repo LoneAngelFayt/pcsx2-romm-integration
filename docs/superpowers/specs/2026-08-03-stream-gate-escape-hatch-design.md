@@ -65,7 +65,14 @@ This placement is the point of the design. As `1736c84` recorded, the nginx
 patch is written into the container's writable layer and is guarded by a grep
 for its own marker, so a gate decided in the nginx config would need a
 `--force-recreate` to switch off and a second one to switch back on. Decided in
-the broker, switching is `docker compose restart pcsx2`.
+the broker, switching is `docker compose up -d pcsx2` after editing the one
+variable.
+
+Not `docker compose restart`. Compose bakes the environment in at create time,
+so a restart replays the old value and the gate silently stays off. The changed
+variable is enough on its own to recreate the container, and because the init
+guards its nginx patch behind a marker grep, re-patching the fresh layer costs
+nothing.
 
 ### The token machinery is untouched
 
@@ -74,8 +81,8 @@ still clears it, and the TTL and grace window still tick. Only enforcement is
 bypassed.
 
 Two payoffs. When #3856 merges, the migration is setting `STREAM_GATE=token`
-and restarting, with no other change. And an operator running the #3856 branch
-today can turn the gate on immediately.
+and bringing the container back up, with no other change. And an operator
+running the #3856 branch today can turn the gate on immediately.
 
 ### Visibility
 

@@ -220,7 +220,13 @@ Two credentials, guarding two different things.
 
 **The gate ships off, and that is a real hole.** With `STREAM_GATE=off`, anyone who can reach port 3000 or 3001 gets the interactive desktop with your ROM library browsable at `/files`, no credential asked for. It defaults to off because RomM cannot send the token yet. The streaming feature people are running is [rommapp/romm#3211](https://github.com/rommapp/romm/pull/3211), which is merged and hands the browser your configured `host` with nothing appended; the half that carries the token into the iframe URL is [rommapp/romm#3856](https://github.com/rommapp/romm/pull/3856), still open. Enforcing against a client that cannot comply is not a gate, it is a black stream: nginx refuses the document, every asset and the WebSocket upgrade alike, with nothing on screen to say why.
 
-So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and restart. No recreate is needed, because enforcement is decided in the broker and the nginx gate is already injected either way. The broker logs which mode it is in at startup, and `GET /status` reports it as `stream_gate`.
+So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and bring the container back up:
+
+```bash
+docker compose up -d pcsx2
+```
+
+Use `up -d`, not `restart`. Compose bakes the environment in at create time, so `docker compose restart` replays the old value and the gate silently stays off. The changed variable is enough on its own to recreate the container; no `--force-recreate` is needed, because enforcement is decided in the broker rather than in the nginx config, and the init re-injects the same gate on the fresh layer either way. Confirm it took: the broker names the mode in its startup log, and `GET /status` reports it as `stream_gate`.
 
 **Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else. The broker logs a warning at startup when it is unset.
 
