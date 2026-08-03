@@ -16,7 +16,7 @@
   `grep -rnP '[\x{2010}-\x{2015}\x{2212}]' README.md root/ tests/ docs/`
 - **No trailing whitespace** (`311b320`, `62d1a34`).
 - **Every commit must be signed.** The repo has `commit.gpgsign=true` and the key signs without a prompt. Never pass `--no-gpg-sign`.
-- **Conventional commit subjects**: `feat(broker):`, `fix(stream):`, `docs:`, `chore:`. Bodies explain the why, in the style of the existing log.
+- **Every commit on this branch uses the `fix(<scope>):` subject.** Not `feat:`, not `docs:`, not `chore:`. `.releaserc.json` runs semantic-release off `main`, where `feat:` cuts a minor version and this branch is a bugfix for a shipped lockout, so it takes a patch. Scopes follow the existing log: `broker` for the Python service, `stream` for the gate and the stream path, `mod` for the s6 and image layer. Bodies explain the why, in the style of the existing log.
 - **Run the full suite and the linter before every commit:**
   ```bash
   python3 -m unittest discover -s tests -q && ruff check .
@@ -482,7 +482,7 @@ Expected: all pass (127 now), `All checks passed!`.
 
 ```bash
 git add root/root/broker.py tests/test_broker.py
-git commit -m "feat(broker): report the stream gate mode at startup and on /status
+git commit -m "fix(broker): report the stream gate mode at startup and on /status
 
 Running with the gate off is a real exposure, so it is stated rather than
 left to be deduced: the startup line names what is reachable (the
@@ -574,7 +574,7 @@ Expected: no syntax error, all tests pass, `All checks passed!`.
 
 ```bash
 git add README.md root/etc/s6-overlay/s6-rc.d/init-pcsx2-config/init.sh
-git commit -m "docs: say plainly that the stream gate ships off
+git commit -m "fix(stream): document that the stream gate ships off
 
 The Security section stated the token gate as settled fact, which stopped
 being true the moment STREAM_GATE landed. It now names the exposure in
