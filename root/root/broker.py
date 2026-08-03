@@ -193,6 +193,48 @@ logging.basicConfig(
 )
 log = logging.getLogger("broker")
 
+# Stream gate enforcement. "token" enforces the nginx auth_request gate: a
+# request reaches the desktop only if it carries the session token that
+# POST /launch mints. "off" admits everything.
+#
+# The default is "off" because RomM has no way to send that token yet.
+# rommapp/romm#3211 is merged and is what people are running, and its claim
+# response hands the browser the operator's configured host with nothing
+# appended; the half that carries the token through to the iframe URL is
+# rommapp/romm#3856, still open. Enforcing against a client that cannot
+# possibly comply refuses the document, every asset and the WebSocket upgrade
+# alike, which is a total lockout rather than a gate. Set STREAM_GATE=token
+# once #3856 ships, and see the README's Security section for what running
+# with it off exposes.
+#
+# Declared here rather than beside STREAM_TOKEN_GRACE with the other stream
+# constants because resolving the value can warn, and `log` does not exist
+# that early in the module.
+STREAM_GATE_MODES   = ("off", "token")
+STREAM_GATE_DEFAULT = "off"
+
+
+def _resolve_stream_gate(raw: str) -> str:
+    """Normalize a STREAM_GATE value to one of STREAM_GATE_MODES.
+
+    An unrecognized value resolves to "off" rather than to the current
+    default. That is on purpose and does not track the default: a typo must
+    fail toward a reachable stream, never toward one nobody can open.
+    """
+    mode = (raw or STREAM_GATE_DEFAULT).strip().lower()
+    if mode not in STREAM_GATE_MODES:
+        log.warning(
+            "STREAM_GATE=%r is not one of %s, falling back to 'off', "
+            "so the stream gate will not be enforced",
+            raw,
+            ", ".join(STREAM_GATE_MODES),
+        )
+        return "off"
+    return mode
+
+
+STREAM_GATE = _resolve_stream_gate(os.environ.get("STREAM_GATE", STREAM_GATE_DEFAULT))
+
 # Warn if the linuxserver init didn't export LD_PRELOAD. Gamepads silently
 # break when only the interposer is loaded without the fake libudev. Logged
 # here (after `log` exists) rather than at module import.

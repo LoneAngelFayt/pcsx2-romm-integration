@@ -798,6 +798,36 @@ class StreamProxyHelperTests(unittest.TestCase):
         )
 
 
+class StreamGateResolveTests(unittest.TestCase):
+    """STREAM_GATE parsing. Anything unrecognized has to land on 'off': the
+    failure this switch exists to prevent is a stream nobody can reach, and a
+    typo in the value must not be able to reintroduce it."""
+
+    def test_known_modes_pass_through(self):
+        self.assertEqual(broker._resolve_stream_gate("off"), "off")
+        self.assertEqual(broker._resolve_stream_gate("token"), "token")
+
+    def test_case_and_whitespace_are_normalized(self):
+        self.assertEqual(broker._resolve_stream_gate("  TOKEN "), "token")
+
+    def test_empty_uses_the_default(self):
+        self.assertEqual(
+            broker._resolve_stream_gate(""), broker.STREAM_GATE_DEFAULT
+        )
+
+    def test_unknown_value_falls_back_to_off_and_warns(self):
+        with mock.patch.object(broker.log, "warning") as warn:
+            self.assertEqual(broker._resolve_stream_gate("banana"), "off")
+        warn.assert_called_once()
+
+    def test_the_shipped_default_is_off(self):
+        # Deliberate, and load bearing: see the spec. Released RomM cannot
+        # send a stream token, so an enforcing default is a total lockout.
+        # Flip this test and the default together when rommapp/romm#3856
+        # merges, never the default alone.
+        self.assertEqual(broker.STREAM_GATE_DEFAULT, "off")
+
+
 class VerifyStreamDecisionTests(unittest.TestCase):
     """The nginx auth_request decision: 200 admits, 403 rejects, and a query
     bootstrap hands back the stream_sid Set-Cookie."""
