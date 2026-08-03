@@ -947,6 +947,51 @@ class StreamGateOffTests(unittest.TestCase):
         self.assertIsNone(cookie)
 
 
+class StreamGateReportingTests(unittest.TestCase):
+    """Whether the desktop is open right now has to be answerable from the
+    container log and from /status, without a shell in the container."""
+
+    def _status_handler(self):
+        h = broker.BrokerHandler.__new__(broker.BrokerHandler)
+        h.path = "/status"
+        h.command = "GET"
+        h.headers = {}
+        h.client_address = ("10.0.0.5", 51234)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        return h
+
+    def _status_body(self, mode):
+        h = self._status_handler()
+        with mock.patch.object(broker, "STREAM_GATE", mode):
+            h._handle_GET()
+        return json.loads(h.wfile.getvalue().decode())
+
+    def test_status_reports_the_enforcing_mode(self):
+        self.assertEqual(self._status_body("token")["stream_gate"], "token")
+
+    def test_status_reports_the_open_mode(self):
+        self.assertEqual(self._status_body("off")["stream_gate"], "off")
+
+    def test_off_warns_at_startup_naming_the_exposure_and_the_fix(self):
+        with mock.patch.object(broker, "STREAM_GATE", "off"):
+            with self.assertLogs("broker", level="WARNING") as cm:
+                broker._log_stream_gate_mode()
+        line = cm.output[0]
+        self.assertIn("WARNING", line)
+        self.assertIn("STREAM_GATE=token", line)
+        self.assertIn("/files", line)
+
+    def test_token_says_so_at_info_and_does_not_warn(self):
+        with mock.patch.object(broker, "STREAM_GATE", "token"):
+            with self.assertNoLogs("broker", level="WARNING"):
+                with self.assertLogs("broker", level="INFO") as cm:
+                    broker._log_stream_gate_mode()
+        self.assertIn("enforced", cm.output[0])
+
+
 class ErrorLoggingTests(unittest.TestCase):
     """Every rejection and fault has to reach stdout, not just the response
     body. The access line is DEBUG and the default level is INFO, so an
