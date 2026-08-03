@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for broker.py.
 
-Development-only — excluded from the Docker image via .dockerignore. Run from
+Development-only, excluded from the Docker image via .dockerignore. Run from
 the repo root with the stdlib runner (no pytest, no dependencies):
 
     python3 -m unittest discover -s tests -v
@@ -13,6 +13,7 @@ container.
 """
 
 import io
+import json
 import os
 import sys
 import tempfile
@@ -225,7 +226,7 @@ class MemoryCardTests(_TempRootMixin, unittest.TestCase):
         self.assertIn("File memory card", broker._replace_memory_card(self._zip({"a": b"b"})))
 
     def test_absent_card_reports_none_not_error(self):
-        """A missing card must be distinguishable from a broken one — the
+        """A missing card must be distinguishable from a broken one: the
         handler turns None into the tagged 404 the backend keys on."""
         self.assertIsNone(broker._build_memory_card_archive())
 
@@ -271,17 +272,26 @@ class IniTests(unittest.TestCase):
         broker._patch_ini()
         self.assertEqual(first, self.ini.read_text())
 
-    def test_initial_slot_read_from_ini(self):
-        self.ini.write_text("[EmuCore]\nSaveStateSlot = 7\n")
-        self.assertEqual(broker._read_initial_save_slot(), 7)
 
-    def test_initial_slot_falls_back_when_out_of_range(self):
-        self.ini.write_text("[EmuCore]\nSaveStateSlot = 99\n")
-        self.assertEqual(broker._read_initial_save_slot(), 1)
+class InitialSlotTests(unittest.TestCase):
+    """The seed comes from the env only. PCSX2 2.6.3 never writes a
+    SaveStateSlot key to its ini, so there is nothing on disk to read."""
 
-    def test_initial_slot_falls_back_when_absent(self):
-        self.ini.write_text("[EmuCore]\n")
-        self.assertEqual(broker._read_initial_save_slot(), 1)
+    def test_reads_env_var(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "7"}):
+            self.assertEqual(broker._initial_save_slot(), 7)
+
+    def test_defaults_to_one_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(broker._initial_save_slot(), 1)
+
+    def test_falls_back_when_out_of_range(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "99"}):
+            self.assertEqual(broker._initial_save_slot(), 1)
+
+    def test_falls_back_when_not_a_number(self):
+        with mock.patch.dict(os.environ, {"BROKER_INITIAL_SLOT": "seven"}):
+            self.assertEqual(broker._initial_save_slot(), 1)
 
 
 class SlotMatchTests(unittest.TestCase):
@@ -398,7 +408,7 @@ class LifecycleTests(unittest.TestCase):
         log_path = Path(tempfile.mkdtemp()) / "pcsx2-qt.log"
         with mock.patch.object(broker, "PCSX2_LOG_PATH", log_path), \
              mock.patch.object(broker.subprocess, "Popen", return_value=self.proc), \
-             mock.patch.object(broker, "_read_initial_save_slot", return_value=1), \
+             mock.patch.object(broker, "_initial_save_slot", return_value=1), \
              mock.patch.object(broker, "Thread") as thread:
             thread.return_value.start.return_value = None
             broker._launch_pcsx2_internal(None)
@@ -452,7 +462,7 @@ class GpuEnvTests(unittest.TestCase):
         with mock.patch.object(broker, "ENV", env), \
              mock.patch.object(broker, "PCSX2_LOG_PATH", log_path), \
              mock.patch.object(broker.subprocess, "Popen") as popen, \
-             mock.patch.object(broker, "_read_initial_save_slot", return_value=1), \
+             mock.patch.object(broker, "_initial_save_slot", return_value=1), \
              mock.patch.object(broker, "Thread") as thread:
             thread.return_value.start.return_value = None
             broker._launch_pcsx2_internal(None)
@@ -625,6 +635,10 @@ class _FakeHandler(broker.BrokerHandler):
         self.path = path
         self._body = body
         self.sent = None
+        # _guarded logs these on the way out; without them a handler raising
+        # inside a test would fail in the logger instead of reporting itself.
+        self.command = "POST"
+        self.client_address = ("127.0.0.1", 0)
 
     def _check_secret(self):
         return True
@@ -668,6 +682,407 @@ class LaunchEndpointTests(_RomRootMixin, unittest.TestCase):
         code, body = self._post_launch(self.tmp / "ps2" / "nope")
         self.assertEqual(code, 422)
         self.assertEqual(body["error"], "rom_path does not exist")
+
+
+class StreamTokenTests(unittest.TestCase):
+    def setUp(self):
+        broker._clear_stream_token()
+
+    def test_issue_returns_nonempty_and_stores(self):
+        tok = broker._issue_stream_token()
+        self.assertTrue(tok)
+        self.assertEqual(broker._session["stream_token"], tok)
+
+    def test_check_accepts_issued_token(self):
+        tok = broker._issue_stream_token()
+        self.assertIsNone(broker._check_stream_token(tok))
+
+    def test_check_rejects_wrong_token(self):
+        broker._issue_stream_token()
+        self.assertIn("does not match", broker._check_stream_token("nope"))
+
+    def test_check_rejects_when_no_token_set(self):
+        self.assertIn("no stream session", broker._check_stream_token("anything"))
+        self.assertIn("no stream token", broker._check_stream_token(""))
+
+    def test_clear_invalidates(self):
+        tok = broker._issue_stream_token()
+        broker._clear_stream_token()
+        self.assertIsNone(broker._session["stream_token"])
+        self.assertIsNotNone(broker._check_stream_token(tok))
+
+
+class StreamTokenLifetimeTests(unittest.TestCase):
+    """The TTL closes an abandoned session; the grace window keeps an open tab
+    alive across a relaunch. Both are wall-clock behaviours, so these tests
+    move the deadlines rather than sleeping."""
+
+    def setUp(self):
+        broker._clear_stream_token()
+
+    def test_issued_token_carries_a_ttl(self):
+        broker._issue_stream_token()
+        remaining = broker._session["stream_expires"] - time.monotonic()
+        self.assertGreater(remaining, broker.STREAM_TOKEN_TTL - 5)
+
+    def test_expired_token_is_rejected(self):
+        tok = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() - 1
+        self.assertIn("expired", broker._check_stream_token(tok))
+
+    def test_use_slides_the_expiry_forward(self):
+        tok = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() + 5
+        self.assertIsNone(broker._check_stream_token(tok))
+        remaining = broker._session["stream_expires"] - time.monotonic()
+        self.assertGreater(remaining, broker.STREAM_TOKEN_TTL - 5)
+
+    def test_reissue_keeps_the_old_token_alive_briefly(self):
+        first = broker._issue_stream_token()
+        second = broker._issue_stream_token()
+        self.assertNotEqual(first, second)
+        # Both work while the grace window is open: an already-open tab is
+        # still replaying the old cookie when RomM navigates to the new URL.
+        self.assertIsNone(broker._check_stream_token(first))
+        self.assertIsNone(broker._check_stream_token(second))
+
+    def test_superseded_token_dies_when_the_grace_window_closes(self):
+        first = broker._issue_stream_token()
+        second = broker._issue_stream_token()
+        with broker._session_lock:
+            broker._session["stream_prev_expires"] = time.monotonic() - 1
+        self.assertIn("superseded", broker._check_stream_token(first))
+        self.assertIsNone(broker._check_stream_token(second))
+
+    def test_grace_does_not_survive_an_explicit_clear(self):
+        first = broker._issue_stream_token()
+        broker._issue_stream_token()
+        broker._clear_stream_token()
+        self.assertIsNotNone(broker._check_stream_token(first))
+
+    def test_live_token_reported_only_while_valid(self):
+        tok = broker._issue_stream_token()
+        self.assertEqual(broker._live_stream_token(), tok)
+        with broker._session_lock:
+            broker._session["stream_expires"] = time.monotonic() - 1
+        self.assertIsNone(broker._live_stream_token())
+
+
+class StreamProxyHelperTests(unittest.TestCase):
+    def test_extract_token_from_query(self):
+        self.assertEqual(
+            broker._extract_stream_token("stream_token=abc&x=1", None), "abc"
+        )
+
+    def test_extract_token_from_cookie(self):
+        self.assertEqual(
+            broker._extract_stream_token("", "stream_sid=abc; other=1"), "abc"
+        )
+
+    def test_query_beats_cookie(self):
+        self.assertEqual(
+            broker._extract_stream_token("stream_token=q", "stream_sid=c"), "q"
+        )
+
+    def test_extract_none_when_absent(self):
+        self.assertIsNone(broker._extract_stream_token("y=2", "foo=bar"))
+        self.assertIsNone(broker._extract_stream_token("", None))
+
+    def test_cookie_value_has_required_attributes(self):
+        v = broker._stream_cookie_value("abc")
+        self.assertEqual(
+            v,
+            "stream_sid=abc; HttpOnly; Secure; SameSite=None; Partitioned; Path=/",
+        )
+
+
+class VerifyStreamDecisionTests(unittest.TestCase):
+    """The nginx auth_request decision: 200 admits, 403 rejects, and a query
+    bootstrap hands back the stream_sid Set-Cookie."""
+
+    def setUp(self):
+        broker._clear_stream_token()
+        with broker._session_lock:
+            broker._session["stream_token"] = "good"
+            broker._session["stream_expires"] = time.monotonic() + 3600
+
+    def test_no_token_is_403(self):
+        status, cookie, reason = broker._verify_stream_decision("/", None)
+        self.assertEqual(status, 403)
+        self.assertIsNone(cookie)
+        self.assertIn("no stream token", reason)
+
+    def test_valid_query_token_admits_and_sets_cookie(self):
+        status, cookie, reason = broker._verify_stream_decision(
+            "/?stream_token=good", None
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            cookie,
+            "stream_sid=good; HttpOnly; Secure; SameSite=None; Partitioned; Path=/",
+        )
+        self.assertIsNone(reason)
+
+    def test_valid_cookie_admits_without_set_cookie(self):
+        status, cookie, _ = broker._verify_stream_decision(
+            "/", "stream_sid=good; other=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(cookie)
+
+    def test_wrong_query_token_is_403(self):
+        status, cookie, reason = broker._verify_stream_decision(
+            "/?stream_token=bad", None
+        )
+        self.assertEqual(status, 403)
+        self.assertIsNone(cookie)
+        self.assertIn("does not match", reason)
+
+    def test_wrong_cookie_is_403(self):
+        status, _, _ = broker._verify_stream_decision("/", "stream_sid=bad")
+        self.assertEqual(status, 403)
+
+    def test_stale_cookie_plus_fresh_query_token_recookies_the_browser(self):
+        # The relaunch case: the tab still holds the superseded stream_sid but
+        # the new iframe URL carries the current token. The query wins, and the
+        # response must carry the new cookie or the tab drops out the moment
+        # the grace window closes.
+        with broker._session_lock:
+            broker._session["stream_prev_token"] = "stale"
+            broker._session["stream_prev_expires"] = time.monotonic() + 60
+        status, cookie, _ = broker._verify_stream_decision(
+            "/?stream_token=good", "stream_sid=stale"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("stream_sid=good", cookie)
+
+    def test_superseded_cookie_alone_still_admits_during_grace(self):
+        with broker._session_lock:
+            broker._session["stream_prev_token"] = "stale"
+            broker._session["stream_prev_expires"] = time.monotonic() + 60
+        status, _, reason = broker._verify_stream_decision("/", "stream_sid=stale")
+        self.assertEqual(status, 200)
+        self.assertIsNone(reason)
+
+
+class ErrorLoggingTests(unittest.TestCase):
+    """Every rejection and fault has to reach stdout, not just the response
+    body. The access line is DEBUG and the default level is INFO, so an
+    unlogged error response is invisible to whoever is reading the logs."""
+
+    def _handler(self, path="/status", command="GET"):
+        h = broker.BrokerHandler.__new__(broker.BrokerHandler)
+        h.path = path
+        h.command = command
+        h.client_address = ("10.0.0.5", 51234)
+        h.wfile = io.BytesIO()
+        h.send_response = lambda *a, **k: None
+        h.send_header = lambda *a, **k: None
+        h.end_headers = lambda: None
+        return h
+
+    def test_4xx_logs_a_warning_naming_the_route_caller_and_reason(self):
+        h = self._handler("/state-file?slot=9")
+        with self.assertLogs("broker", level="WARNING") as cm:
+            h._send_json(404, {"error": "no state file for slot", "slot": 9})
+        line = cm.output[0]
+        self.assertIn("WARNING", line)
+        self.assertIn("HTTP 404 GET /state-file?slot=9 from 10.0.0.5", line)
+        self.assertIn("no state file for slot", line)
+        self.assertIn("slot=9", line)
+
+    def test_5xx_logs_at_error_and_keeps_the_detail_field(self):
+        h = self._handler("/volume", "POST")
+        with self.assertLogs("broker", level="ERROR") as cm:
+            h._send_json(500, {"error": "pactl failed", "detail": "no such sink"})
+        line = cm.output[0]
+        self.assertIn("ERROR", line)
+        self.assertIn("pactl failed", line)
+        self.assertIn("detail=no such sink", line)
+
+    def test_success_responses_are_not_logged_as_failures(self):
+        h = self._handler()
+        with self.assertNoLogs("broker", level="WARNING"):
+            h._send_json(200, {"ok": True})
+
+    def test_unhandled_exception_logs_a_traceback_and_still_answers_500(self):
+        h = self._handler("/status")
+
+        def boom():
+            raise RuntimeError("simulated PINE explosion")
+
+        with self.assertLogs("broker", level="ERROR") as cm:
+            h._guarded(boom)
+        joined = "\n".join(cm.output)
+        self.assertIn("unhandled error in the broker request handler", joined)
+        self.assertIn("simulated PINE explosion", joined)
+        self.assertIn("Traceback", joined)
+        self.assertEqual(
+            json.loads(h.wfile.getvalue().decode())["error"], "internal broker error"
+        )
+
+    def test_client_disconnect_is_a_warning_not_a_traceback(self):
+        h = self._handler()
+
+        def gone():
+            raise BrokenPipeError()
+
+        with self.assertLogs("broker", level="WARNING") as cm:
+            h._guarded(gone)
+        joined = "\n".join(cm.output)
+        self.assertIn("client disconnected before the response was sent", joined)
+        self.assertNotIn("Traceback", joined)
+
+    def test_stream_token_never_reaches_the_log(self):
+        self.assertEqual(
+            broker._redact_uri("/websockify?stream_token=SUPERSECRET&x=1"),
+            "/websockify?stream_token=REDACTED&x=1",
+        )
+
+    def test_redaction_leaves_an_ordinary_uri_alone(self):
+        self.assertEqual(broker._redact_uri("/state-file?slot=3"), "/state-file?slot=3")
+
+
+class HeaderTokenTests(unittest.TestCase):
+    """Header values go out unvalidated by http.server, so a CR or LF in a
+    filename would split the response. _header_token is the one filter."""
+
+    def test_crlf_is_stripped(self):
+        out = broker._header_token("evil\r\nX-Injected: yes.p2s", "state.p2s")
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\n", out)
+
+    def test_non_ascii_is_stripped(self):
+        self.assertEqual(broker._header_token("Pokémon.p2s", "x"), "Pokmon.p2s")
+
+    def test_a_name_with_nothing_left_falls_back(self):
+        self.assertEqual(broker._header_token("\r\n\t", "state.p2s"), "state.p2s")
+
+    def test_an_ordinary_name_survives_intact(self):
+        self.assertEqual(
+            broker._header_token("SLUS-21295 (A1B2C3D4).01.p2s", "x"),
+            "SLUS-21295 (A1B2C3D4).01.p2s",
+        )
+
+
+class _FakePutHandler(broker.BrokerHandler):
+    """Drives do_PUT without a socket."""
+
+    def __init__(self, path, body=b""):
+        self.path = path
+        self.rfile = io.BytesIO(body)
+        self.headers = {"Content-Length": str(len(body))}
+        self.sent = None
+        self.command = "PUT"
+        self.client_address = ("127.0.0.1", 0)
+
+    def _check_secret(self):
+        return True
+
+    def _send_json(self, code, body, headers=None):
+        self.sent = (code, body)
+
+
+class _FakeGetHandler(broker.BrokerHandler):
+    """Drives do_GET without a socket, capturing headers rather than writing."""
+
+    def __init__(self, path):
+        self.path = path
+        self.headers = {}
+        self.sent = None
+        self.command = "GET"
+        self.client_address = ("127.0.0.1", 0)
+        self.wfile = io.BytesIO()
+        self.sent_headers = []
+        self.response_code = None
+
+    def _check_secret(self):
+        return True
+
+    def _send_json(self, code, body, headers=None):
+        self.sent = (code, body)
+
+    def send_response(self, code):
+        self.response_code = code
+
+    def send_header(self, name, value):
+        self.sent_headers.append((name, value))
+
+    def end_headers(self):
+        pass
+
+
+class StateFileNameTests(unittest.TestCase):
+    """PUT refuses a name that could split a header, and GET sanitises the
+    name it echoes back in case one predates the PUT-side check."""
+
+    def setUp(self):
+        _reset_session()
+        self.addCleanup(_reset_session)
+
+    def test_crlf_filename_is_refused_by_put(self):
+        h = _FakePutHandler("/state-file?filename=a%0d%0aX-Injected:+yes.p2s", b"x")
+        h.do_PUT()
+        code, body = h.sent
+        self.assertEqual(code, 400)
+        self.assertIn("printable ASCII", body["error"])
+
+    def test_an_ordinary_filename_is_still_stored(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(broker, "SSTATE_DIR", Path(td)), \
+                 mock.patch.object(broker.os, "chown"):
+                h = _FakePutHandler("/state-file?filename=SLUS-21295.01.p2s", b"data")
+                h.do_PUT()
+            self.assertEqual(h.sent[0], 200)
+            self.assertEqual((Path(td) / "SLUS-21295.01.p2s").read_bytes(), b"data")
+
+    def test_get_sanitises_a_crlf_name_already_on_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "a\r\nX-Injected: yes.01.p2s").write_bytes(b"state")
+            with mock.patch.object(broker, "SSTATE_DIR", Path(td)):
+                h = _FakeGetHandler("/state-file?slot=1")
+                h.do_GET()
+        self.assertEqual(h.response_code, 200)
+        emitted = dict(h.sent_headers)["X-State-Filename"]
+        self.assertNotIn("\r", emitted)
+        self.assertNotIn("\n", emitted)
+
+
+class SecretCheckTests(unittest.TestCase):
+    """The shared secret is compared as bytes: hmac.compare_digest rejects a
+    str carrying non-ASCII, so a UTF-8 BROKER_SECRET used to raise inside every
+    _check_secret and answer 500 to every request rather than 403."""
+
+    class _Req:
+        def __init__(self, header):
+            self.headers = {} if header is None else {"X-Broker-Secret": header}
+
+    def _check(self, secret, sent):
+        with mock.patch.object(broker, "SECRET", secret), \
+             mock.patch.object(broker, "_SECRET_BYTES", secret.encode("utf-8")):
+            return broker.BrokerHandler._check_secret(self._Req(sent))
+
+    def test_utf8_secret_accepts_the_bytes_that_arrive_on_the_wire(self):
+        secret = "pässwort"
+        # http.server hands header values back latin-1-decoded, so this is what
+        # _check_secret actually sees when a client sends the UTF-8 secret.
+        on_the_wire = secret.encode("utf-8").decode("latin-1")
+        self.assertTrue(self._check(secret, on_the_wire))
+
+    def test_utf8_secret_rejects_a_wrong_one_rather_than_raising(self):
+        self.assertFalse(self._check("pässwort", "nope"))
+
+    def test_ascii_secret_still_matches(self):
+        self.assertTrue(self._check("plain-secret", "plain-secret"))
+
+    def test_a_missing_header_is_rejected(self):
+        self.assertFalse(self._check("plain-secret", None))
+
+    def test_an_unset_secret_accepts_everything(self):
+        with mock.patch.object(broker, "SECRET", ""):
+            self.assertTrue(broker.BrokerHandler._check_secret(self._Req(None)))
 
 
 if __name__ == "__main__":

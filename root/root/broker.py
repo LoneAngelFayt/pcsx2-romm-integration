@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""broker.py — launch PCSX2 on demand and expose a small HTTP API."""
+"""broker.py: launch PCSX2 on demand and expose a small HTTP API."""
 
 import calendar
 import glob
@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket as _socket
@@ -18,6 +19,7 @@ import sys
 import time
 import zipfile
 from collections.abc import Iterable
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
@@ -27,6 +29,11 @@ from urllib.parse import parse_qs, urlparse
 
 PORT     = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET   = os.environ.get("BROKER_SECRET", "")
+# The secret is compared as bytes, never as str: hmac.compare_digest refuses a
+# str with non-ASCII characters, so a UTF-8 BROKER_SECRET would raise inside
+# every _check_secret and answer 500 to every request. Encoding once here keeps
+# the comparison total for any secret an operator can set.
+_SECRET_BYTES = SECRET.encode("utf-8")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 
 # JSON request bodies are tiny (a rom_path, a slot number); anything larger
@@ -111,8 +118,8 @@ _LD_PRELOAD_FROM_ENV = "LD_PRELOAD" in os.environ and bool(os.environ["LD_PRELOA
 # pcsx2-qt is launched through `sudo -u abc env K=V ...`, and sudo's default
 # env_reset drops everything the container was started with. Only the names
 # spelled out on that `env` line survive the hop, so every renderer knob an
-# operator sets in docker-compose — VK_DRIVER_FILES, __GLX_VENDOR_LIBRARY_NAME,
-# MESA_VK_DEVICE_SELECT — used to be silently discarded, leaving Vulkan to
+# operator sets in docker-compose (VK_DRIVER_FILES, __GLX_VENDOR_LIBRARY_NAME,
+# MESA_VK_DEVICE_SELECT) used to be silently discarded, leaving Vulkan to
 # enumerate on its own and settle for whatever ICD it could find (lavapipe,
 # which names itself "llvmpipe"). Forward the vendor namespaces wholesale
 # rather than an exact list so a knob we haven't heard of still arrives.
@@ -121,7 +128,7 @@ _GPU_ENV_PREFIXES = (
     "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
 )
 # XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
-# icd.d/ — dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# icd.d/. Dropping it hides ICDs installed outside /usr/share. DRINODE is the
 # linuxserver base image's render-node selector, which misses the DRI_ prefix.
 _GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
 
@@ -139,7 +146,7 @@ def _gpu_env() -> dict[str, str]:
 
 
 ENV = {
-    # Inherited GPU vars come first so the computed entries below always win —
+    # Inherited GPU vars come first so the computed entries below always win:
     # DISPLAY and LD_PRELOAD are derived from live container state and must not
     # be shadowed by a stale value from the container environment.
     **_gpu_env(),
@@ -165,6 +172,19 @@ SSTATE_DIR   = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"
 RESUME_LOAD_WAIT   = float(os.environ.get("RESUME_LOAD_WAIT",   "90.0"))
 RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "3.0"))
 
+# Stream token lifetime. The TTL is idle time, not absolute: every admitted
+# request slides it forward, so it only fires on a session nobody is watching.
+# Without it a token minted by /launch stays valid until an explicit release,
+# and a container that loses its RomM side (crash, network partition, a user
+# who just closes the tab) leaves the gate open indefinitely.
+STREAM_TOKEN_TTL   = float(os.environ.get("STREAM_TOKEN_TTL",   "43200.0"))
+# How long the superseded token keeps working after a re-issue. Relaunching
+# into an already-open tab means the browser is still replaying the old
+# stream_sid cookie while RomM navigates the iframe to the new URL; without
+# this window every one of those in-flight requests 403s and the stream client
+# reports a dropped connection and retries in a loop.
+STREAM_TOKEN_GRACE = float(os.environ.get("STREAM_TOKEN_GRACE", "120.0"))
+
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [broker] %(levelname)s %(message)s",
@@ -173,7 +193,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("broker")
 
-# Warn if the linuxserver init didn't export LD_PRELOAD — gamepads silently
+# Warn if the linuxserver init didn't export LD_PRELOAD. Gamepads silently
 # break when only the interposer is loaded without the fake libudev. Logged
 # here (after `log` exists) rather than at module import.
 if not _LD_PRELOAD_FROM_ENV:
@@ -228,9 +248,137 @@ _session: dict = {
     # GET /save-file only ships files modified at or after this point; it
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline":    None,
+    # Random per-session token gating the stream proxy on port 3001. Minted on
+    # /launch, swapped for a cookie by the browser, cleared on release. The
+    # expiry is a monotonic deadline refreshed on every admitted request; the
+    # prev_* pair holds the token a re-issue replaced, valid for a short grace
+    # window so an already-open tab is not cut off mid-relaunch.
+    "stream_token":         None,
+    "stream_expires":       0.0,
+    "stream_prev_token":    None,
+    "stream_prev_expires":  0.0,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _issue_stream_token() -> str:
+    """Mint a fresh stream token and bind it to the current session.
+
+    The token being replaced is demoted rather than dropped: it stays usable
+    for STREAM_TOKEN_GRACE seconds so requests already in flight from an open
+    tab still land. See STREAM_TOKEN_GRACE for why that matters.
+    """
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    with _session_lock:
+        previous = _session["stream_token"]
+        if previous:
+            _session["stream_prev_token"] = previous
+            _session["stream_prev_expires"] = now + STREAM_TOKEN_GRACE
+        _session["stream_token"] = token
+        _session["stream_expires"] = now + STREAM_TOKEN_TTL
+    return token
+
+
+def _check_stream_token(token: str) -> str | None:
+    """Judge token against the live session token, then the superseded one.
+
+    Returns None when the token is good, otherwise a short reason for the log.
+    A hit on the live token slides its expiry forward: the TTL exists to close
+    an abandoned session, not to interrupt someone who is still playing.
+    """
+    if not token:
+        return "no stream token in the request"
+    now = time.monotonic()
+    with _session_lock:
+        current = _session["stream_token"]
+        if not current:
+            return "no stream session is open"
+        if hmac.compare_digest(token, current):
+            if now >= _session["stream_expires"]:
+                return "stream token expired after %.0fs idle" % STREAM_TOKEN_TTL
+            _session["stream_expires"] = now + STREAM_TOKEN_TTL
+            return None
+        previous = _session["stream_prev_token"]
+        if previous and hmac.compare_digest(token, previous):
+            if now < _session["stream_prev_expires"]:
+                return None
+            _session["stream_prev_token"] = None
+            _session["stream_prev_expires"] = 0.0
+            return "stream token superseded by a newer launch"
+    return "stream token does not match the open session"
+
+
+def _clear_stream_token() -> None:
+    """Drop the stream token so the gate rejects everything until next launch."""
+    with _session_lock:
+        _session["stream_token"] = None
+        _session["stream_expires"] = 0.0
+        _session["stream_prev_token"] = None
+        _session["stream_prev_expires"] = 0.0
+
+
+def _live_stream_token() -> str | None:
+    """The session token if it is still inside its TTL, else None.
+
+    /status hands this to RomM so a reconnecting client can re-attach without
+    a relaunch. An expired token would only send it into the 403 loop the TTL
+    is there to end, so it is reported as absent.
+    """
+    with _session_lock:
+        if _session["stream_token"] and time.monotonic() < _session["stream_expires"]:
+            return _session["stream_token"]
+    return None
+
+
+def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
+    """Read the stream token: query stream_token wins, else the stream_sid cookie."""
+    qs = parse_qs(query)
+    if qs.get("stream_token"):
+        return qs["stream_token"][0]
+    if cookie_header:
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+        if "stream_sid" in jar:
+            return jar["stream_sid"].value
+    return None
+
+
+def _stream_cookie_value(token: str) -> str:
+    """Set-Cookie value for the stream session. SameSite=None, Secure, and
+    Partitioned are required: the iframe is cross-site to RomM, so the cookie
+    is third-party and browsers partition or drop it without these attributes."""
+    return (
+        f"stream_sid={token}; HttpOnly; Secure; "
+        "SameSite=None; Partitioned; Path=/"
+    )
+
+
+def _verify_stream_decision(
+    original_uri: str, cookie_header: str | None
+) -> tuple[int, str | None, str | None]:
+    """Decide an nginx auth_request subrequest for the stream gate.
+
+    Returns (status, set_cookie, reason). 200 admits the request, 403 rejects
+    it and carries the reason so the refusal is legible in the container log.
+    When the token arrives in the query (the first iframe load), the caller
+    gets a Set-Cookie so later requests carry stream_sid and the token drops
+    out of the URL. A cookie-authed request that is already good gets no
+    Set-Cookie back, so nginx does not rewrite it.
+    """
+    query = urlparse(original_uri).query
+    token = _extract_stream_token(query, cookie_header)
+    reason = _check_stream_token(token or "")
+    if reason:
+        return 403, None, reason
+    if "stream_token" in parse_qs(query):
+        # Re-cookie on the query bootstrap, and also when the query token is
+        # the current one but the cookie still holds the superseded token:
+        # the browser must be moved onto the new value before the grace
+        # window closes, or the tab drops out the moment it does.
+        return 200, _stream_cookie_value(token), None
+    return 200, None, None
+
 
 def _validate_rom_path(raw: str) -> Path | None:
     """Resolve raw to an absolute path and confirm it lives under ROM_ROOT."""
@@ -347,10 +495,10 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
 def _patch_ini():
     """Force broker-required PCSX2.ini settings. Each key is scoped to its
     expected section so identically-named keys in other sections aren't stomped.
-    Failures are logged loudly — silent failure here means PCSX2 launches with
+    Failures are logged loudly: silent failure here means PCSX2 launches with
     the wrong PINE/Fullscreen/Shutdown settings and downstream features break."""
     if not INI_PATH.exists():
-        log.warning("PCSX2.ini not found at %s — skipping patch", INI_PATH)
+        log.warning("PCSX2.ini not found at %s, skipping patch", INI_PATH)
         return
 
     # (section, key) → "key = value" line.
@@ -409,44 +557,30 @@ def _patch_ini():
         tmp.replace(INI_PATH)  # atomic on POSIX; prevents partial-write corruption
         log.debug("PCSX2.ini patched (PINE, Fullscreen, NoConfirmShutdown, SaveStateOnShutdown)")
     except OSError as exc:
-        log.error("PCSX2.ini patch failed (filesystem): %s — broker settings NOT applied", exc)
+        log.error("PCSX2.ini patch failed (filesystem): %s, broker settings NOT applied", exc)
     except Exception:
-        log.exception("PCSX2.ini patch failed unexpectedly — broker settings NOT applied")
+        log.exception("PCSX2.ini patch failed unexpectedly, broker settings NOT applied")
 
 
-def _read_initial_save_slot() -> int:
-    """Best-effort read of PCSX2's last-used save slot from PCSX2.ini.
+def _initial_save_slot() -> int:
+    """Slot the broker assumes PCSX2 boots on, from BROKER_INITIAL_SLOT (default 1).
 
-    PCSX2 persists the active save state slot in [EmuCore] under
-    `SaveStateSlot`. If the key is absent or the file is unreadable, fall
-    back to the BROKER_INITIAL_SLOT env var (default 1). Used by the launch
-    handler to seed the slot tracker so xdotool save-state cycling targets
-    the right slot on the first save after launch.
+    There is no way to learn PCSX2's real starting slot. It is not persisted to
+    PCSX2.ini (verified on 2.6.3: cycling the slot with F2 mid-game never writes
+    a SaveStateSlot key, not on cycle, not on graceful shutdown) and PINE has no
+    command to query it. So the launch handler seeds the tracker from this env
+    var and _xdotool_cycle_to_slot keeps it in step from there. Operators who
+    change the slot outside the broker will desync it until the next launch.
     """
-    fallback = int(os.environ.get("BROKER_INITIAL_SLOT", "1"))
-    if not INI_PATH.exists():
-        return fallback
+    raw = os.environ.get("BROKER_INITIAL_SLOT", "1")
     try:
-        section = ""
-        for raw in INI_PATH.read_text().splitlines():
-            line = raw.strip()
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1]
-                continue
-            if section != "EmuCore":
-                continue
-            if line.startswith("SaveStateSlot =") or line.startswith("SaveStateSlot="):
-                _, _, value = line.partition("=")
-                try:
-                    n = int(value.strip())
-                except ValueError:
-                    return fallback
-                if 1 <= n <= 10:
-                    return n
-                return fallback
-    except OSError as exc:
-        log.debug("Could not read SaveStateSlot from PCSX2.ini: %s", exc)
-    return fallback
+        slot = int(raw)
+    except ValueError:
+        slot = 0
+    if not 1 <= slot <= 10:
+        log.warning("BROKER_INITIAL_SLOT=%r is not a slot in 1-10; assuming 1", raw)
+        return 1
+    return slot
 
 
 def _kill_pcsx2():
@@ -466,12 +600,12 @@ def _kill_pcsx2():
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            log.warning("PCSX2 did not exit after SIGTERM — sending SIGKILL")
+            log.warning("PCSX2 did not exit after SIGTERM, sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                log.error("PCSX2 did not exit after SIGKILL — giving up")
+                log.error("PCSX2 did not exit after SIGKILL, giving up")
     except ProcessLookupError:
         pass  # already gone
 
@@ -513,7 +647,7 @@ def _launch_pcsx2_internal(rom_path):
             stdout=log_fh if log_fh else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
             # New session ⇒ own process group, so killpg is clean. Unlike
-            # preexec_fn (unsafe with threads — can deadlock between fork and
+            # preexec_fn (unsafe with threads, can deadlock between fork and
             # exec in this ThreadingHTTPServer process), this is thread-safe.
             start_new_session=True,
         )
@@ -530,15 +664,14 @@ def _launch_pcsx2_internal(rom_path):
         if log_fh:
             log_fh.close()
 
-    initial_slot = _read_initial_save_slot()
+    initial_slot = _initial_save_slot()
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
-        # An instance is up again — whatever the limiter concluded is stale.
+        # An instance is up again, whatever the limiter concluded is stale.
         _session["relaunch_abandoned"] = False
-        # PCSX2's persisted slot from PCSX2.ini, or BROKER_INITIAL_SLOT.
-        # We can't query PCSX2 for its live slot, so this is a best-effort seed
-        # that tracks the same value PCSX2 itself loads on startup.
+        # BROKER_INITIAL_SLOT. PCSX2 neither persists nor exposes its live slot,
+        # so this is an assumption the xdotool cycling then tracks, not a read.
         _session["current_slot"] = initial_slot
     log.info("PCSX2 launched (PID %d, initial save slot %d)", proc.pid, initial_slot)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
@@ -560,7 +693,7 @@ def _monitor_process(proc, start_time):
     rapid = 0
     with _session_lock:
         should_relaunch = _session["is_managed"] and _session["process"] is proc
-        # Only unexpected exits count toward the crash-loop limit — a
+        # Only unexpected exits count toward the crash-loop limit. A
         # deliberate kill (/save-and-exit, DELETE /launch) cleared is_managed
         # and must not push the counter toward a false trip.
         if should_relaunch:
@@ -575,7 +708,7 @@ def _monitor_process(proc, start_time):
 
     if rapid >= _CRASH_LOOP_LIMIT:
         log.error(
-            "PCSX2 exited within 5s %d times in a row — giving up on relaunch. "
+            "PCSX2 exited within 5s %d times in a row, giving up on relaunch. "
             "Fix the underlying failure, then POST /launch to recover.",
             rapid,
         )
@@ -585,14 +718,14 @@ def _monitor_process(proc, start_time):
 
     # Back off if the process died almost immediately to avoid a tight crash loop.
     wait_time = 5 if duration < 5 else 1
-    log.info("PCSX2 exited after %.1fs — relaunching dashboard in %ds", duration, wait_time)
+    log.info("PCSX2 exited after %.1fs, relaunching dashboard in %ds", duration, wait_time)
     time.sleep(wait_time)
 
     # The crash relaunch is a lifecycle sequence like any other: it must hold
     # the launch claim, or a concurrent /launch interleaves with it and the
     # monitor stomps the new game's session state with Dashboard.
     if not _claim_launch():
-        log.info("Crash relaunch skipped — a launch is already in progress")
+        log.info("Crash relaunch skipped, a launch is already in progress")
         return
     try:
         with _session_lock:
@@ -622,7 +755,7 @@ def _drain_gamepad_sockets():
       2. Keep-alive loop: while self.running and not writer.is_closing().
 
     Connecting and immediately sending SHUT_WR causes readexactly(1) in phase 1
-    to raise IncompleteReadError — the handler exits and removes itself from the
+    to raise IncompleteReadError, the handler exits and removes itself from the
     active client list without ever entering phase 2.
 
     Phase-2 handlers are unaffected; their loop has no EOF check. They clear on
@@ -692,8 +825,8 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
             # _kill_pcsx2 already reaped the managed process group, so any
             # survivor is an unmanaged stray. Strays sit on top of the new
             # game window, steal xdotool targeting, and unlink the live
-            # instance's PINE socket when they finally exit — reap them.
-            log.warning("Stray pcsx2-qt still running after kill+drain — sending SIGKILL")
+            # instance's PINE socket when they finally exit. Reap them.
+            log.warning("Stray pcsx2-qt still running after kill+drain, sending SIGKILL")
             subprocess.run(["pkill", "-9", "-x", "pcsx2-qt"], capture_output=True)
             if not _wait_for_no_pcsx2():
                 log.error("Stray pcsx2-qt survived SIGKILL; new instance may misbehave")
@@ -718,7 +851,7 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
         if load_slot is not None:
             # Spawned here (not by the HTTP handler) so the deferred loader
             # carries this launch's seq and aborts if a later launch lands.
-            # Skipped when Popen failed — no point polling PINE for
+            # Skipped when Popen failed, no point polling PINE for
             # RESUME_LOAD_WAIT against a VM that never started.
             with _session_lock:
                 launched = _session["process"] is not None
@@ -727,9 +860,9 @@ def _launch_pcsx2(rom_path, release_claim=False, load_slot=None):
                     target=_deferred_load_state, args=(load_slot, seq), daemon=True
                 ).start()
             else:
-                log.warning("resume: launch failed — slot %d load not scheduled", load_slot)
+                log.warning("resume: launch failed, slot %d load not scheduled", load_slot)
     finally:
-        # Only the caller that claimed launch_in_progress may release it —
+        # Only the caller that claimed launch_in_progress may release it:
         # clearing it unconditionally would wipe a concurrent claim and
         # reopen the TOCTOU.
         if release_claim:
@@ -744,7 +877,7 @@ def _claim_card_op() -> bool:
     borrowing the launch claim made the monitor's crash relaunch skip and
     never retry, leaving no emulator running at all. This flag blocks GAME
     launches (which mount the card) while letting the gameless dashboard
-    recover — the dashboard never opens a memory card, and the replace is an
+    recover: the dashboard never opens a memory card, and the replace is an
     atomic staging swap, so a relaunch mid-hydrate sees either the old card
     or the new one, never a partial.
 
@@ -772,7 +905,7 @@ def _relaunch_dashboard():
     already in flight, skip: that launch's kill+start sequence supersedes
     the dashboard anyway, and interleaving the two corrupts both."""
     if not _claim_launch():
-        log.info("Dashboard relaunch skipped — a launch is already in progress")
+        log.info("Dashboard relaunch skipped, a launch is already in progress")
         return
     _launch_pcsx2(None, release_claim=True)
 
@@ -780,7 +913,7 @@ def _relaunch_dashboard():
 def _sstate_snapshot() -> dict:
     """Return {Path: (size, mtime)} for every .p2s file currently in SSTATE_DIR."""
     if not SSTATE_DIR.is_dir():
-        log.debug("Save: SSTATE_DIR absent — %s", SSTATE_DIR)
+        log.debug("Save: SSTATE_DIR absent: %s", SSTATE_DIR)
         return {}
     snap = {}
     for p in SSTATE_DIR.glob("*.p2s"):
@@ -789,7 +922,7 @@ def _sstate_snapshot() -> dict:
             snap[p] = (st.st_size, st.st_mtime)
         except OSError:
             pass
-    log.debug("Save: snapshot — %d file(s) in %s", len(snap), SSTATE_DIR)
+    log.debug("Save: snapshot: %d file(s) in %s", len(snap), SSTATE_DIR)
     return snap
 
 
@@ -801,11 +934,11 @@ def _matches_slot(p: Path, slot: int) -> bool:
 def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = None) -> bool:
     """Poll SSTATE_DIR until a save state write completes or deadline is reached.
 
-    When `slot` is given, only files named for that slot count — otherwise an
+    When `slot` is given, only files named for that slot count, otherwise an
     unrelated .p2s write (autosave, user F1) would confirm a save that never
     happened. Detects both new files and overwrites of existing ones (by mtime change).
     Once a target file is found, waits for its size to be stable for 0.5 s
-    before returning — handles both direct writes and atomic rename patterns.
+    before returning. Handles both direct writes and atomic rename patterns.
 
     Returns True if a completed write was detected, False if deadline elapsed.
     """
@@ -828,7 +961,7 @@ def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = Non
                     target = p
                     last_size = size
                     stable_since = time.monotonic()
-                    log.debug("Save: write detected — %s (%d bytes, mtime %.3f)", p.name, size, mtime)
+                    log.debug("Save: write detected: %s (%d bytes, mtime %.3f)", p.name, size, mtime)
                     break
                 else:
                     log.debug("Save: %s unchanged (mtime %.3f)", p.name, mtime)
@@ -844,7 +977,7 @@ def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = Non
                     stable_since = time.monotonic()
                 elif time.monotonic() - stable_since >= STABLE_SECS:  # type: ignore[operator]
                     log.info(
-                        "Save: state write complete — %s (%d bytes) in %.1fs",
+                        "Save: state write complete: %s (%d bytes) in %.1fs",
                         target.name, last_size,
                         time.monotonic() - start,
                     )
@@ -867,7 +1000,7 @@ STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
 def _wait_for_save_idle(deadline: float) -> bool:
     """Block until no save is in flight. Returns False when the deadline
-    passes with a save still running — callers must refuse to serve state
+    passes with a save still running, callers must refuse to serve state
     files in that case, not ship a half-written one."""
     while time.monotonic() < deadline:
         with _session_lock:
@@ -962,7 +1095,7 @@ def _pine_save_state(slot: int) -> bool | None:
         return None
     # PCSX2 queues the save onto the VM thread and replies immediately, so
     # confirm the actual write the same way the xdotool path does.
-    log.info("PINE: save state accepted (slot %d) — waiting for write (max %.1fs)", slot, PINE_WAIT)
+    log.info("PINE: save state accepted (slot %d), waiting for write (max %.1fs)", slot, PINE_WAIT)
     if _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, slot):
         return True
     log.warning("PINE: save accepted but no state file write within %.1fs (slot %d)", PINE_WAIT, slot)
@@ -974,7 +1107,7 @@ def _save_state(slot: int) -> bool:
     result = _pine_save_state(slot)
     if result is not None:
         return result
-    log.warning("PINE unavailable — falling back to xdotool F-key delivery")
+    log.warning("PINE unavailable, falling back to xdotool F-key delivery")
     return _xdotool_save_state(slot)
 
 
@@ -983,7 +1116,7 @@ def _load_state(slot: int) -> bool:
     if _pine_request(_PINE_MSG_LOAD_STATE, bytes([slot])) is not None:
         log.info("PINE: load state accepted (slot %d)", slot)
         return True
-    log.warning("PINE unavailable — falling back to xdotool F-key delivery")
+    log.warning("PINE unavailable, falling back to xdotool F-key delivery")
     return _xdotool_load_state(slot)
 
 
@@ -999,7 +1132,7 @@ def _deferred_load_state(slot: int, seq: int) -> None:
     """Resume-from-state: load `slot` once the freshly launched game's VM is up.
 
     Waits for the launch to finish swapping instances before trusting the
-    status probe — probing earlier could see a still-running previous game
+    status probe: probing earlier could see a still-running previous game
     and load the slot into the wrong VM. After the swap, only the new game
     VM reports running (a gameless relaunch reports shutdown).
 
@@ -1013,19 +1146,19 @@ def _deferred_load_state(slot: int, seq: int) -> None:
             launching = _session["launch_in_progress"]
             superseded = _session["launch_seq"] != seq
         if superseded:
-            log.info("resume: launch superseded — slot %d load abandoned", slot)
+            log.info("resume: launch superseded, slot %d load abandoned", slot)
             return
         if not launching and _pine_emu_status() == 0:
             time.sleep(RESUME_LOAD_SETTLE)
             with _session_lock:
                 if _session["launch_seq"] != seq:
-                    log.info("resume: launch superseded — slot %d load abandoned", slot)
+                    log.info("resume: launch superseded, slot %d load abandoned", slot)
                     return
             ok = _load_state(slot)
             log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
             return
         time.sleep(1.0)
-    log.warning("resume: VM never reached running state — slot %d not loaded", slot)
+    log.warning("resume: VM never reached running state, slot %d not loaded", slot)
 
 
 _XDOTOOL_ENV = {
@@ -1090,7 +1223,7 @@ def _xdotool_find_window() -> str | None:
         log.warning("xdotool: classname fallback failed to invoke: %s", exc)
 
     log.warning(
-        "xdotool: PCSX2 window not found (PIDs %s, last error: %s) — F-key shortcuts will not be delivered",
+        "xdotool: PCSX2 window not found (PIDs %s, last error: %s), F-key shortcuts will not be delivered",
         pids, last_search_err,
     )
     return None
@@ -1194,7 +1327,7 @@ def _xdotool_save_state(slot: int) -> bool:
         return False
 
     log.info(
-        "xdotool: F1 sent to window %s (slot %d) — waiting for write (max %.1fs)",
+        "xdotool: F1 sent to window %s (slot %d), waiting for write (max %.1fs)",
         wid, slot, PINE_WAIT,
     )
     deadline = time.monotonic() + PINE_WAIT
@@ -1283,7 +1416,7 @@ def _pactl(*args: str) -> subprocess.CompletedProcess:
 
 
 def _pactl_get_volume() -> int | None:
-    """Return current sink volume as an integer 0–100, or None on error."""
+    """Return current sink volume as an integer 0-100, or None on error."""
     result = _pactl("get-sink-volume", "@DEFAULT_SINK@")
     if result.returncode != 0:
         return None
@@ -1322,9 +1455,9 @@ SAVE_SYNC_SUBTREES = ("memcards",)
 # subfolder, so 256 MB is far above anything real. It is a hard ceiling, not a
 # tunable: exceeding it fails the sync outright (GET 413 / PUT 413), it is NOT
 # read from the environment, and both the whole archive and the extracted size
-# are held in memory. If a card ever legitimately grows past this — a card pool
+# are held in memory. If a card ever legitimately grows past this (a card pool
 # far larger than expected, or a future non-memcard subtree added to
-# SAVE_SYNC_SUBTREES — raising the number alone is not enough: the transfer has
+# SAVE_SYNC_SUBTREES) raising the number alone is not enough: the transfer has
 # to move to streaming/chunked I/O first, or the broker will OOM before it hits
 # the limit. Same reasoning applies to STATE_FILE_MAX_BYTES above.
 SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
@@ -1381,7 +1514,7 @@ def _read_file_stable(
             data = p.read_bytes()
             st_after = p.stat()
         except OSError as exc:
-            log.warning("save-file: could not read %s — %s", p, exc)
+            log.warning("save-file: could not read %s: %s", p, exc)
             return None
         if (st_before.st_size, st_before.st_mtime_ns) == (
             st_after.st_size,
@@ -1390,14 +1523,14 @@ def _read_file_stable(
             return data, st_after.st_mtime
         if attempt < retries - 1:
             time.sleep(settle)
-    log.warning("save-file: %s still being written — skipped this pull", p)
+    log.warning("save-file: %s still being written, skipped this pull", p)
     return None
 
 
 def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | str:
     """Zip every save file modified since the last game launch.
 
-    Returns (zip_bytes, skipped) — `skipped` counts files left out because
+    Returns (zip_bytes, skipped). `skipped` counts files left out because
     they were unreadable or still being written; zip_bytes is None when
     every changed file was skipped, so the caller can refuse the pull
     instead of serving an empty archive as a clean sync. Returns None when
@@ -1434,7 +1567,7 @@ def _build_save_archive(baseline: float) -> tuple[bytes | None, int] | None | st
                 skipped += 1
                 continue
             data, mtime = result
-            # UTC, matched by calendar.timegm on extract — a TZ difference
+            # UTC, matched by calendar.timegm on extract, a TZ difference
             # between the GET and PUT containers must not shift mtimes and
             # silently break the newer-file guard.
             info = zipfile.ZipInfo(
@@ -1470,7 +1603,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
     Returns (written, skipped, failed), or an error string for a bad archive.
     Existing files newer than their archive member are skipped so a restore
     can never roll back saves made since the archive was taken. A per-file
-    write failure doesn't abort the restore — remaining members still land,
+    write failure doesn't abort the restore: remaining members still land,
     the failure is counted, and the handler reports it; the mtime guard
     makes a retry of the same archive idempotent."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
@@ -1509,7 +1642,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
             except OSError as exc:
-                log.warning("save-file: could not restore %s — %s", info.filename, exc)
+                log.warning("save-file: could not restore %s: %s", info.filename, exc)
                 failed += 1
                 continue
             written += 1
@@ -1521,7 +1654,7 @@ def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
 # replaces the ENTIRE Slot-1 folder card (superblock + every game folder) as one
 # host-independent image, so a user's card can be hydrated onto any pooled
 # container. GET evacuates the whole card; PUT wipes Slot 1 and lays the card
-# back down. Only Slot 1 is ever touched — Slot 2 is never synced.
+# back down. Only Slot 1 is ever touched. Slot 2 is never synced.
 
 
 # Serializes whole-card operations: os.getpid() is constant in this process,
@@ -1535,8 +1668,8 @@ def _memcards_dir() -> Path:
 
 
 def _slot1_filename() -> str | None:
-    """Read [MemoryCards] Slot1_Filename from PCSX2.ini (manual parse, matching
-    _read_initial_save_slot). Returns the configured card name, or None."""
+    """Read [MemoryCards] Slot1_Filename from PCSX2.ini by manual line scan.
+    Returns the configured card name, or None."""
     if not INI_PATH.exists():
         return None
     try:
@@ -1594,7 +1727,7 @@ def _build_memory_card_archive() -> bytes | None | str:
             try:
                 zf.write(p, p.relative_to(path).as_posix())
             except OSError as exc:
-                log.warning("memory-card: could not read %s — %s", p, exc)
+                log.warning("memory-card: could not read %s: %s", p, exc)
     return buf.getvalue()
 
 
@@ -1611,7 +1744,7 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
         # This container is misprovisioned: hydrate needs a Folder card in slot 1.
         # Log loudly so the offending host surfaces in monitoring, then refuse.
         log.warning(
-            "memory-card: hydrate rejected on %s — slot 1 is a File card at %s",
+            "memory-card: hydrate rejected on %s, slot 1 is a File card at %s",
             _socket.gethostname(),
             path,
         )
@@ -1658,10 +1791,10 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
                 try:
                     os.replace(backup, path)
                 except OSError:
-                    # The backup is now the only surviving copy of the card —
+                    # The backup is now the only surviving copy of the card:
                     # leave it on disk for manual recovery instead of deleting it.
                     log.error(
-                        "memory-card: could not restore card to %s — old card preserved at %s",
+                        "memory-card: could not restore card to %s, old card preserved at %s",
                         path,
                         backup,
                     )
@@ -1674,6 +1807,28 @@ def _replace_memory_card(content: bytes) -> tuple[int] | str:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _redact_uri(uri: str) -> str:
+    """Strip the stream token out of a URI before it reaches the log.
+
+    The stream gate admits a viewer on `?stream_token=...`, so logging a raw
+    request line would put a live credential in stdout, where it is exactly the
+    text an operator pastes into a bug report.
+    """
+    return re.sub(r"(stream_token=)[^&]*", r"\1REDACTED", uri)
+
+
+def _header_token(value: str, fallback: str) -> str:
+    """Reduce `value` to something safe to send as an HTTP header value.
+
+    Header values are latin-1 and http.server writes them through without
+    validating, so a CR or LF reaching send_header splits the response. Both
+    callers pass names taken off the filesystem, where those bytes are legal
+    in a filename, so the filter belongs here rather than at each call site.
+    """
+    safe = "".join(c for c in value if c.isascii() and c.isprintable()).strip()
+    return safe or fallback
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -1682,12 +1837,87 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _check_secret(self) -> bool:
         if not SECRET:
             return True
+        # latin-1 is how http.server decoded the header, so encoding it back
+        # recovers exactly the bytes that arrived on the wire, which is what
+        # _SECRET_BYTES is comparable against.
         return hmac.compare_digest(
-            self.headers.get("X-Broker-Secret", ""),
-            SECRET,
+            self.headers.get("X-Broker-Secret", "").encode("latin-1", "replace"),
+            _SECRET_BYTES,
         )
 
+    def _verify_stream(self) -> None:
+        # nginx auth_request subrequest for the stream gate. nginx forwards the
+        # real request URI (carrying the stream_token query on first load) via
+        # X-Original-URI and the browser Cookie header; the broker returns 200
+        # to admit or 403 to reject, and a Set-Cookie on the query bootstrap.
+        status, set_cookie, reason = _verify_stream_decision(
+            self.headers.get("X-Original-URI", ""),
+            self.headers.get("Cookie"),
+        )
+        headers = {"Set-Cookie": set_cookie} if set_cookie else None
+        body = {"ok": status == 200}
+        if status != 200:
+            body["error"] = reason or "stream request rejected"
+        self._send_json(status, body, headers)
+
+    def _log_error_response(self, code: int, body: dict) -> None:
+        """Announce every 4xx/5xx on stdout, not just in the response body.
+
+        The access line is DEBUG and the default level is INFO, so without this
+        a rejected or failed request is invisible to an operator reading
+        container logs: the integration looks like it did nothing at all. 5xx
+        is a broker-side fault (ERROR), 4xx is a caller-side one (WARNING).
+        """
+        reason = body.get("error", "request rejected")
+        if not isinstance(reason, str):
+            reason = json.dumps(reason)
+        # Everything else in the body is context the operator wants (slot,
+        # path, pactl stderr). "ok" is the /verify flag, already implied.
+        extras = ", ".join(
+            f"{k}={v}" for k, v in body.items() if k not in ("error", "ok")
+        )
+        emit = log.error if code >= 500 else log.warning
+        emit(
+            "HTTP %d %s %s from %s: %s%s",
+            code,
+            self.command,
+            _redact_uri(self.path),
+            self.client_address[0],
+            reason,
+            f" ({extras})" if extras else "",
+        )
+
+    def _guarded(self, handler) -> None:
+        """Run a do_* handler so no failure mode can exit without a trace.
+
+        An exception escaping the handler otherwise unwinds into socketserver,
+        which prints a bare traceback to stderr outside the broker's log format
+        and leaves the caller with a reset connection and no response at all.
+        """
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            log.warning(
+                "HTTP %s %s from %s: client disconnected before the response was sent",
+                self.command,
+                _redact_uri(self.path),
+                self.client_address[0],
+            )
+        except Exception:
+            log.exception(
+                "HTTP %s %s from %s: unhandled error in the broker request handler",
+                self.command,
+                _redact_uri(self.path),
+                self.client_address[0],
+            )
+            try:
+                self._send_json(500, {"error": "internal broker error"})
+            except Exception:
+                log.error("Could not send the 500 response, the connection is already gone")
+
     def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
+        if code >= 400:
+            self._log_error_response(code, body)
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -1700,7 +1930,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> dict | None:
         """Parse the JSON request body. Returns {} for an absent body. Sends
         the error response itself and returns None when the body is oversized
-        or not a JSON object — callers must bail out on None."""
+        or not a JSON object, callers must bail out on None."""
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -1731,7 +1961,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if slot == 0:
             slot = SAVE_SLOT
         if not (1 <= slot <= 10):
-            self._send_json(400, {"error": "slot must be 0–10"})
+            self._send_json(400, {"error": "slot must be 0-10"})
             return
 
         # Block while a save is being written so the caller never receives a
@@ -1745,7 +1975,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "no state file for slot", "slot": slot})
             return
         try:
-            # Size-check via stat before reading — never hold an oversized
+            # Size-check via stat before reading, never hold an oversized
             # file in memory just to refuse it.
             if state_path.stat().st_size > STATE_FILE_MAX_BYTES:
                 self._send_json(413, {"error": "state file exceeds size limit"})
@@ -1757,7 +1987,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(content)))
-        self.send_header("X-State-Filename", state_path.name)
+        self.send_header(
+            "X-State-Filename", _header_token(state_path.name, "state.p2s")
+        )
         self.end_headers()
         self.wfile.write(content)
         log.info("state-file: served %s (%d bytes)", state_path.name, len(content))
@@ -1786,9 +2018,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
         # Header values must be latin-1; ROM stems can be anything.
-        safe_name = "".join(
-            c for c in (rom_name or "pcsx2") if c.isascii() and c.isprintable()
-        ).strip() or "pcsx2"
+        safe_name = _header_token(rom_name or "pcsx2", "pcsx2")
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(archive)))
@@ -1826,7 +2056,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         written, skipped, failed = result
         if failed:
             log.warning(
-                "save-file: restore incomplete — %d written, %d skipped, %d failed",
+                "save-file: restore incomplete: %d written, %d skipped, %d failed",
                 written, skipped, failed,
             )
             self._send_json(500, {
@@ -1834,7 +2064,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "written": written, "skipped": skipped, "failed": failed,
             })
             return
-        log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
+        log.info("save-file: restored archive: %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
     def _get_memory_card(self):
@@ -1897,7 +2127,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         # Claim for the whole replace. Re-checks "no game running" atomically,
         # closing the TOCTOU against a /launch that lands during the body read
-        # above — POST /launch refuses while this claim is held.
+        # above. POST /launch refuses while this claim is held.
         if not _claim_card_op():
             self._send_json(
                 409, {"error": "cannot replace memory card while a game is running or launching"}
@@ -1917,10 +2147,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": result})
             return
         (written,) = result
-        log.info("memory-card: replaced slot-1 card — %d files", written)
+        log.info("memory-card: replaced slot-1 card: %d files", written)
         self._send_json(200, {"status": "ok", "written": written})
 
     def do_PUT(self):
+        self._guarded(self._handle_PUT)
+
+    def _handle_PUT(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
@@ -1935,12 +2168,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Basename only — the filename came from a previous GET and is written
+        # Basename only: the filename came from a previous GET and is written
         # back verbatim so PCSX2 recognises the slot; path parts are rejected.
         raw_name = parse_qs(parsed.query).get("filename", [""])[0]
         filename = Path(raw_name).name
         if not filename or filename.startswith(".") or not filename.endswith(".p2s"):
             self._send_json(400, {"error": "filename must be a .p2s basename"})
+            return
+        # CR and LF are legal in a Linux filename, so without this a stored name
+        # carrying them would split the response when GET /state-file echoes it
+        # back as X-State-Filename. _header_token sanitises that emit too; this
+        # refuses the name outright rather than silently storing a mangled one.
+        if filename != _header_token(filename, ""):
+            self._send_json(400, {"error": "filename must be printable ASCII"})
             return
 
         try:
@@ -1976,11 +2216,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "ok", "filename": filename})
 
     def do_GET(self):
+        self._guarded(self._handle_GET)
+
+    def _handle_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif path == "/verify":
+            self._verify_stream()
         elif not self._check_secret():
-            # /health stays open for container healthchecks; all other GETs
+            # /health and /verify stay open; /health for container healthchecks,
+            # /verify because the stream token is itself the credential (nginx
+            # auth_request cannot forward the broker secret). All other GETs
             # require the shared secret, matching POST/DELETE.
             self._send_json(403, {"error": "forbidden"})
         elif path == "/state-file":
@@ -2006,11 +2253,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # and nothing will restart it without an explicit POST /launch.
                 # Distinguishes a dead container from an idle dashboard.
                 "relaunch_abandoned": abandoned,
+                "stream_token": _live_stream_token() if active else None,
             })
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._guarded(self._handle_POST)
+
+    def _handle_POST(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
@@ -2039,7 +2290,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(slot, int) or not (0 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 0–10"})
+                self._send_json(400, {"error": "slot must be 0-10"})
                 return
             # Slot 0 is a legacy value meaning "use the default autosave slot".
             if slot == 0:
@@ -2052,9 +2303,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     with _session_lock:
                         _session["save_in_progress"] = False
                 if not ok:
-                    log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", slot)
+                    log.warning("streaming: save state failed (slot %d), relaunching dashboard anyway", slot)
                 self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
-                # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
+                # Save-and-exit releases the session, so the stream token must
+                # die with it: a discovered host is otherwise still usable.
+                _clear_stream_token()
+                # Relaunch to dashboard regardless of save result, PCSX2 is already dead.
                 Thread(target=_relaunch_dashboard, daemon=True).start()
             else:
                 # Clear visible session state synchronously so that callers
@@ -2065,6 +2319,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _session["rom_path"] = None
                     _session["rom_name"] = "Dashboard"
                     _session["started_at"] = None
+                # Save-and-exit releases the session, so the stream token must
+                # die with it: a discovered host is otherwise still usable.
+                _clear_stream_token()
 
                 def _bg(s):
                     try:
@@ -2073,8 +2330,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         with _session_lock:
                             _session["save_in_progress"] = False
                     if not ok:
-                        log.warning("streaming: save state failed (slot %d) — relaunching dashboard anyway", s)
-                    # Relaunch to dashboard regardless of save result — PCSX2 is already dead.
+                        log.warning("streaming: save state failed (slot %d), relaunching dashboard anyway", s)
+                    # Relaunch to dashboard regardless of save result, PCSX2 is already dead.
                     _relaunch_dashboard()
                 Thread(target=_bg, args=(slot,), daemon=True).start()
                 self._send_json(200, {"status": "queued", "slot": slot})
@@ -2086,7 +2343,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
-                self._send_json(400, {"error": "level must be an integer 0–100"})
+                self._send_json(400, {"error": "level must be an integer 0-100"})
                 return
             result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
@@ -2131,7 +2388,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 with _session_lock:
                     _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–10"})
+                self._send_json(400, {"error": "slot must be 1-10"})
                 return
             def _bg_save(s):
                 try:
@@ -2155,7 +2412,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
-                self._send_json(400, {"error": "slot must be 1–10"})
+                self._send_json(400, {"error": "slot must be 1-10"})
                 return
             ok = _load_state(slot)
             if ok:
@@ -2214,11 +2471,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if load_slot is not None and (
             not isinstance(load_slot, int) or not (1 <= load_slot <= 10)
         ):
-            self._send_json(400, {"error": "load_slot must be 1–10"})
+            self._send_json(400, {"error": "load_slot must be 1-10"})
             return
 
         # Check save_in_progress and claim launch_in_progress in the same lock
-        # acquisition — checking them separately lets a save start in the gap,
+        # acquisition: checking them separately lets a save start in the gap,
         # and the launch would then kill PCSX2 mid-savestate.
         with _session_lock:
             if _session["save_in_progress"]:
@@ -2234,12 +2491,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             _session["launch_in_progress"] = True
 
+        stream_token = _issue_stream_token()
         Thread(
             target=_launch_pcsx2, args=(str(rom_path), True, load_slot), daemon=True
         ).start()
-        self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+        self._send_json(200, {
+            "status": "launching",
+            "rom_path": str(rom_path),
+            "stream_token": stream_token,
+        })
 
     def do_DELETE(self):
+        self._guarded(self._handle_DELETE)
+
+    def _handle_DELETE(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
@@ -2247,11 +2512,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
 
-        # Same claim as POST /launch — a soft reset interleaved with a live
+        # Same claim as POST /launch, a soft reset interleaved with a live
         # launch would run two kill+start sequences against one session.
         if not _claim_launch():
             self._send_json(409, {"error": "launch already in progress"})
             return
+        # DELETE /launch releases the session, so the stream token must die
+        # with it: a discovered host is otherwise still usable.
+        _clear_stream_token()
         Thread(target=_launch_pcsx2, args=(None, True), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
@@ -2262,7 +2530,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     """Stop the HTTP listener, finish any in-flight save, then kill PCSX2.
     Triggered on SIGTERM/SIGINT so `systemctl stop` doesn't drop a save mid-write."""
-    log.info("Received signal %d — beginning graceful shutdown", signum)
+    log.info("Received signal %d, beginning graceful shutdown", signum)
     # Stop accepting new requests immediately so /save-and-exit can't race us.
     Thread(target=server.shutdown, daemon=True).start()
 
@@ -2276,14 +2544,14 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight save did not complete within %.1fs — killing PCSX2 anyway", save_wait)
+        log.warning("Shutdown: in-flight save did not complete within %.1fs, killing PCSX2 anyway", save_wait)
 
     _kill_pcsx2()
     log.info("Shutdown complete")
 
 
 def main():
-    log.info("Broker starting — waiting for desktop X display...")
+    log.info("Broker starting, waiting for desktop X display...")
     display = _wait_for_x_display(timeout=30.0)
     if display is None:
         log.error("No live X display appeared within 30s; pcsx2-qt will likely fail to launch")
@@ -2303,7 +2571,7 @@ def main():
     if result.returncode == 0:
         log.info("Killed stale pcsx2-qt instance(s) on startup.")
         if not _wait_for_no_pcsx2(timeout=3.0):
-            log.warning("Stale pcsx2-qt instance still running after SIGKILL — OS may be slow")
+            log.warning("Stale pcsx2-qt instance still running after SIGKILL, OS may be slow")
 
     _patch_ini()
     _launch_pcsx2_internal(None)
@@ -2316,7 +2584,7 @@ def main():
     if SECRET:
         log.info("Shared secret auth enabled")
     else:
-        log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
+        log.warning("BROKER_SECRET not set, all POST/DELETE endpoints are unauthenticated")
 
     # Install a single handler for both SIGTERM (systemd stop) and SIGINT
     # (Ctrl-C). We intentionally don't use server.serve_forever()'s default

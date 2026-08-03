@@ -108,20 +108,22 @@ Save states don't care about any of this. The requirement is only for memory-car
 
 | Variable | Default | What it does |
 |---|---|---|
-| `BROKER_SECRET` | *(none)* | Shared secret, sent as `X-Broker-Secret`. Unset means every request is accepted, which is not safe on a shared network. |
+| `BROKER_SECRET` | *(none)* | Shared secret, sent as `X-Broker-Secret`. Unset means every request is accepted. Debug-only, see [Security](#security). |
 | `BROKER_PORT` | `8000` | Port the broker listens on. |
 | `ROM_ROOT` | `/romm/library` | Where ROMs are mounted. A `rom_path` outside this is rejected. |
-| `SAVE_SLOT` | `10` | Slot `/save-and-exit` uses when none is given. 10 as autosave leaves 1–9 for the player. |
+| `SAVE_SLOT` | `10` | Slot `/save-and-exit` uses when none is given. 10 as autosave leaves 1-9 for the player. |
 | `PINE_WAIT` | `20.0` | Seconds to poll for a state write to land after a save is accepted. Stops early once the file appears. Raise it for slow disks. |
 | `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | Where PCSX2 writes `.p2s` files, and where `/state-file` reads and writes them. |
 | `SAVE_DATA_ROOT` | `/config/.config/PCSX2` | PCSX2 data dir for `/save-file` and `/memory-card`. Only `memcards/` under it is synced. |
 | `STATE_GET_WAIT` | `30.0` | How long `GET /state-file` waits for an in-flight save before giving up. |
 | `RESUME_LOAD_WAIT` | `90.0` | How long a `load_slot` launch waits for the game VM to report running. |
 | `RESUME_LOAD_SETTLE` | `3.0` | Grace period after the VM reports running, before the deferred state load fires. |
-| `BROKER_INITIAL_SLOT` | `1` | Slot the broker assumes PCSX2 booted on when it can't read `SaveStateSlot` from the ini. Only matters for xdotool cycling. |
+| `BROKER_INITIAL_SLOT` | `1` | Slot the broker assumes PCSX2 booted on. PCSX2 never reports its real one, so this is the seed the xdotool cycling tracks from. Only matters for xdotool cycling. |
 | `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | Captures pcsx2-qt stdout and stderr. Renderer and Vulkan failures show up here. Appended across launches. |
 | `BROKER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. The xdotool window-found messages are DEBUG. |
 | `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for PCSX2, which runs as `abc` and has to overwrite them later. |
+| `STREAM_TOKEN_TTL` | `43200.0` | Idle seconds before a stream token stops working. Every admitted request slides it forward, so it only fires on a session nobody is watching. Stops an abandoned session leaving the stream gate open forever. |
+| `STREAM_TOKEN_GRACE` | `120.0` | How long the previous token keeps working after a relaunch mints a new one, so an already-open tab is not cut off mid-navigation. |
 
 ## API
 
@@ -148,7 +150,7 @@ JSON bodies are capped at 64 KB and file bodies at 256 MB. Anything larger is a 
 | `POST /mute` | `{"mute": true}`, or omit `mute` to toggle. The response is read back from PulseAudio, not echoed | `500` pactl failed |
 | `POST /cleanup` | Restart Selkies to flush stale gamepad sockets. Use it if controllers go dead | none |
 
-Slots are 1–10 everywhere. `/save-and-exit` and `GET /state-file` also accept `0`, which means "use `SAVE_SLOT`".
+Slots are 1-10 everywhere. `/save-and-exit` and `GET /state-file` also accept `0`, which means "use `SAVE_SLOT`".
 
 ### Session state
 
@@ -186,7 +188,7 @@ That last row is almost always a GPU or renderer failure, and `PCSX2_LOG_PATH` w
 
 A folder with nothing bootable in it returns `422` with an `extensions` list, which is a different message from the `422` for a path that doesn't exist. Every broker in this family behaves the same way here.
 
-`load_slot` (1–10) resumes from a state. The broker waits for the VM to report running over PINE, gives it `RESUME_LOAD_SETTLE` seconds to settle, then loads. Push the state file with `PUT /state-file` *before* you launch.
+`load_slot` (1-10) resumes from a state. The broker waits for the VM to report running over PINE, gives it `RESUME_LOAD_SETTLE` seconds to settle, then loads. Push the state file with `PUT /state-file` *before* you launch.
 
 ### Saving is asynchronous
 
@@ -206,13 +208,27 @@ State files are named `{SERIAL} ({CRC}).{slot:02d}.p2s`, which is PCSX2's own sc
 
 It is refused while a game is running or a launch is in flight, because PCSX2 holds the card open and swapping it mid-game corrupts it. Hydrate before launch or after exit. `POST /launch` is refused for the duration too, so a launch can't slip in mid-replace. Dashboard crash recovery is *not* blocked, since the gameless dashboard never opens a card and the swap is atomic either way.
 
+## Security
+
+Two credentials, guarding two different things.
+
+**`BROKER_SECRET` guards the API on port 8000.** Sent as `X-Broker-Secret`, compared in constant time. `GET /health` and `GET /verify` are deliberately exempt: `/health` so it works as a container healthcheck, `/verify` because nginx's `auth_request` cannot forward the secret and the stream token is itself the credential there.
+
+**The stream token guards the desktop on 3000/3001.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy — direct plain-HTTP browsing to it now fails closed.
+
+**Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else. The broker logs a warning at startup when it is unset.
+
+Port 8000 is plain HTTP, so the secret crosses the network in the clear. Keep the broker on an internal network, or put TLS in front of it.
+
 ## Troubleshooting
+
+**Reading the logs.** Every request the broker refuses or fails is logged to stdout, not only returned as JSON, so `docker logs pcsx2` is enough to see what went wrong without turning on `DEBUG`. The shape is `HTTP <code> <method> <path> from <caller>: <reason>`. A `WARNING` is a caller-side rejection (bad slot, no game running, a claim already held); an `ERROR` is a broker-side fault (pactl failed, a state file that could not be written) and always deserves attention. An unhandled crash inside a handler logs a full traceback and still answers `500 internal broker error` rather than dropping the connection. Stream tokens are redacted from logged URLs, so log output is safe to paste into a bug report.
 
 **The mod doesn't apply, or the broker never starts.** Check the image name (`ghcr.io/loneangelfayt/pcsx2-romm-integration-mod`), confirm the base image is `lscr.io/linuxserver/pcsx2:latest` or compatible, and run `docker compose up` without `-d` to watch the whole startup.
 
-**Black screen for more than a minute.** 15–30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).
+**Black screen for more than a minute.** 15-30 seconds is just the PS2 BIOS. Longer than that, check the BIOS files exist (`docker exec pcsx2 ls /config/bios`) and read PCSX2's own log (`docker exec pcsx2 tail -50 /config/.config/PCSX2/logs/emulog.txt`).
 
-**Controllers dead.** Try `POST /cleanup` to restart Selkies and flush stale sockets. Confirm the sockets exist at all with `docker exec pcsx2 ls /tmp/selkies_js*.sock`, and check the broker logs for `LD_PRELOAD`.
+**Controllers dead.** Try `POST /cleanup` to restart Selkies and flush stale sockets. Confirm the sockets exist at all with `docker exec pcsx2 ls /tmp/selkies_js*.sock`, and check the broker logs for `LD_PRELOAD`. The mod pins the `selkies_gamepad` logger to `WARNING`, so the absence of per-socket `INFO:selkies_gamepad:` chatter is expected and not a sign the gamepads are gone; real gamepad warnings and errors still come through. Startup logs whether that patch applied, so `docker logs pcsx2 | grep broker-mod` tells you if it silently missed.
 
 **Saves failing.** `docker logs pcsx2 | grep PINE`. No xdotool lines at all is healthy: xdotool only appears when PINE is unreachable. If you do see `PINE unavailable`, look for xdotool output, and remember the "found window" message is DEBUG-level while the "window not found" warning shows by default. Bump `PINE_WAIT` if saves are just slow, and check what actually landed with `docker exec pcsx2 ls /config/.config/PCSX2/sstates`.
 
@@ -224,6 +240,20 @@ It is refused while a game is running or a launch is in flight, because PCSX2 ho
 
 **RomM shows no play button.** Confirm `streaming.enabled: true`, confirm the platform slug matches, restart RomM after config changes, and check what RomM thinks it has: `curl http://romm:5000/api/streaming/config`.
 
+**"A critical video error occurred. Resetting to default settings and reloading...", two or three times before the stream finally plays.** This is Selkies' client-side decoder fallback, not the broker. The browser's WebCodecs `VideoDecoder` throws a fatal error on the H.264 stream, so the client closes the WebSocket, downgrades its encoder setting, and reloads after three seconds. On the third failure it switches to `jpeg`, which forces CPU encoding and works, which is why it always plays *eventually*. It never self-heals, because the client zeroes its crash counter when it lands on `jpeg` and the next launch starts over from the server default.
+
+The usual cause is the hardware encoder: Selkies routes `x264enc` through VAAPI whenever a render node is present, and the container log shows `[Wayland] Initializing Unified VAAPI Encoder...` right before each crash. Force software encoding to keep H.264 without the VAAPI path:
+
+```yaml
+- SELKIES_USE_CPU=true
+```
+
+Confirm it took with `docker logs pcsx2 | grep -E "VAAPI|CPU Software"`. If it still cycles, drop to `SELKIES_ENCODER=jpeg` to skip H.264 entirely, at a real cost in bandwidth and sharpness.
+
+**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: the mod's init never patched nginx. Check `docker logs pcsx2 | grep broker-mod` for the "Applied nginx stream gate to N vhost(s)" line, which should say 2.
+
+**A stream that 403s on every asset over plain HTTP.** The `stream_sid` cookie is `Secure`, so a browser will not store it on an unencrypted origin. The query token admits the first request and everything after it is refused. Reach the container over TLS: either port 3001 directly, or port 3000 behind a reverse proxy that terminates TLS. Plain-HTTP 3000 straight to a browser is not a supported shape and now fails closed rather than serving an ungated desktop.
+
 ## Development
 
 The broker is one stdlib Python file with a stdlib `unittest` suite. Nothing to install, which is the point: the container has no pip, so the broker cannot grow a dependency without breaking the image.
@@ -234,7 +264,9 @@ python3 -m unittest discover -s tests -v
 
 CI runs the same tests under pytest, plus `ruff check .` against the shared [ruff.toml](ruff.toml). `tests/` is excluded from the image by `.dockerignore` and never ships.
 
-The suite covers what can be tested without a running emulator: save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching, ROM path resolution, and the session state machine (crash-loop limiter, launch and card-op claims, deferred `load_slot` generation checks). Anything needing a real X display, PINE socket, or pcsx2-qt process is out of scope on purpose, because it is only provable on a live container.
+The suite covers what can be tested without a running emulator: save-file and memory-card archive handling (round trips, the last-write-wins mtime guard, path-traversal and subtree rejection, File-card refusal), `PCSX2.ini` patching, ROM path resolution, the session state machine (crash-loop limiter, launch and card-op claims, deferred `load_slot` generation checks), the stream-token gate decision, and the header/secret handling that keeps a filename off the response line and a UTF-8 secret out of a 500. Anything needing a real X display, PINE socket, or pcsx2-qt process is out of scope on purpose, because it is only provable on a live container.
+
+**Init ordering matters more than it looks.** The mod ships two s6 oneshots. `init-pcsx2-config` rewrites files that base-image services read exactly once at startup (selkies' `input_handler.py`, the nginx site config, labwc's autostart), so `init-services` is made to depend on it and the whole service stack waits. Drop that edge and the patches still land on disk while changing nothing about the processes already running, which fails silently: the log says "Applied nginx stream gate" and the live nginx has no gate. Keep that script fast and offline. `init-pcsx2-deps` holds the slow networked work (apt, `patches.zip`) and only `svc-broker` waits for it, so a GitHub timeout cannot stall the stream.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/) and releases are cut automatically on merge to `main`: `fix:` bumps the patch, `feat:` the minor, `feat!:` the major.
 
