@@ -798,11 +798,47 @@ class StreamProxyHelperTests(unittest.TestCase):
         )
 
 
+class StreamGateResolveTests(unittest.TestCase):
+    """STREAM_GATE parsing. Anything unrecognized has to land on 'off': the
+    failure this switch exists to prevent is a stream nobody can reach, and a
+    typo in the value must not be able to reintroduce it."""
+
+    def test_known_modes_pass_through(self):
+        self.assertEqual(broker._resolve_stream_gate("off"), "off")
+        self.assertEqual(broker._resolve_stream_gate("token"), "token")
+
+    def test_case_and_whitespace_are_normalized(self):
+        self.assertEqual(broker._resolve_stream_gate("  TOKEN "), "token")
+
+    def test_empty_uses_the_default(self):
+        self.assertEqual(
+            broker._resolve_stream_gate(""), broker.STREAM_GATE_DEFAULT
+        )
+
+    def test_unknown_value_falls_back_to_off_and_warns(self):
+        with mock.patch.object(broker.log, "warning") as warn:
+            self.assertEqual(broker._resolve_stream_gate("banana"), "off")
+        warn.assert_called_once()
+
+    def test_the_shipped_default_is_off(self):
+        # Deliberate, and load bearing: see the spec. Released RomM cannot
+        # send a stream token, so an enforcing default is a total lockout.
+        # Flip this test and the default together when rommapp/romm#3856
+        # merges, never the default alone.
+        self.assertEqual(broker.STREAM_GATE_DEFAULT, "off")
+
+
 class VerifyStreamDecisionTests(unittest.TestCase):
-    """The nginx auth_request decision: 200 admits, 403 rejects, and a query
-    bootstrap hands back the stream_sid Set-Cookie."""
+    """The nginx auth_request decision under STREAM_GATE=token: 200 admits,
+    403 rejects, and a query bootstrap hands back the stream_sid Set-Cookie."""
 
     def setUp(self):
+        # These cover the enforcing path, so pin the mode. The shipped
+        # default is "off" (see StreamGateResolveTests), under which every
+        # 403 assertion below would pass for the wrong reason.
+        gate = mock.patch.object(broker, "STREAM_GATE", "token")
+        gate.start()
+        self.addCleanup(gate.stop)
         broker._clear_stream_token()
         with broker._session_lock:
             broker._session["stream_token"] = "good"
@@ -865,6 +901,50 @@ class VerifyStreamDecisionTests(unittest.TestCase):
         status, _, reason = broker._verify_stream_decision("/", "stream_sid=stale")
         self.assertEqual(status, 200)
         self.assertIsNone(reason)
+
+
+class StreamGateOffTests(unittest.TestCase):
+    """STREAM_GATE=off admits every request. The escape hatch exists for a
+    RomM that cannot send a token at all (rommapp/romm#3856 unmerged), so the
+    cases that matter are exactly the ones the gate would otherwise refuse."""
+
+    def setUp(self):
+        gate = mock.patch.object(broker, "STREAM_GATE", "off")
+        gate.start()
+        self.addCleanup(gate.stop)
+        broker._clear_stream_token()
+
+    def test_no_token_admits(self):
+        # What released RomM actually sends: the bare configured host.
+        status, cookie, reason = broker._verify_stream_decision("/", None)
+        self.assertEqual(status, 200)
+        self.assertIsNone(cookie)
+        self.assertIsNone(reason)
+
+    def test_garbage_cookie_admits(self):
+        status, cookie, _ = broker._verify_stream_decision("/", "stream_sid=bad")
+        self.assertEqual(status, 200)
+        self.assertIsNone(cookie)
+
+    def test_admits_with_no_session_open(self):
+        # setUp cleared the token, so the enforcing path would answer
+        # "no stream session is open" and refuse the whole iframe.
+        status, _, reason = broker._verify_stream_decision("/websocket?x=1", None)
+        self.assertEqual(status, 200)
+        self.assertIsNone(reason)
+
+    def test_a_valid_token_is_not_cookied_when_the_gate_is_off(self):
+        # An operator already running the rommapp/romm#3856 branch can be
+        # sending a good token while the gate is off. It is admitted like
+        # everything else, and there is no session to hand the browser.
+        with broker._session_lock:
+            broker._session["stream_token"] = "good"
+            broker._session["stream_expires"] = time.monotonic() + 3600
+        status, cookie, _ = broker._verify_stream_decision(
+            "/?stream_token=good", None
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(cookie)
 
 
 class ErrorLoggingTests(unittest.TestCase):
