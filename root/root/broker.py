@@ -407,7 +407,14 @@ def _verify_stream_decision(
     gets a Set-Cookie so later requests carry stream_sid and the token drops
     out of the URL. A cookie-authed request that is already good gets no
     Set-Cookie back, so nginx does not rewrite it.
+
+    Under STREAM_GATE=off none of that runs and every request is admitted.
     """
+    if STREAM_GATE == "off":
+        # The switch is off: admit without reading the token. No Set-Cookie
+        # either, because there is no gate for a cookie to satisfy later and
+        # nginx would only rewrite the response for nothing.
+        return 200, None, None
     query = urlparse(original_uri).query
     token = _extract_stream_token(query, cookie_header)
     reason = _check_stream_token(token or "")
