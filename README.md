@@ -45,6 +45,7 @@ services:
       - DOCKER_MODS=ghcr.io/loneangelfayt/pcsx2-romm-integration-mod:latest
       - BROKER_SECRET=your_secret_here
       - ROM_ROOT=/romm/library
+      - STREAM_GATE=off        # see Security; 'token' once RomM sends the token
     ports:
       - 8000:8000   # broker API
     volumes:
@@ -124,6 +125,7 @@ Save states don't care about any of this. The requirement is only for memory-car
 | `PUID` / `PGID` | `1000` | Standard LinuxServer UID/GID. Also used to chown files the broker writes for PCSX2, which runs as `abc` and has to overwrite them later. |
 | `STREAM_TOKEN_TTL` | `43200.0` | Idle seconds before a stream token stops working. Every admitted request slides it forward, so it only fires on a session nobody is watching. Stops an abandoned session leaving the stream gate open forever. |
 | `STREAM_TOKEN_GRACE` | `120.0` | How long the previous token keeps working after a relaunch mints a new one, so an already-open tab is not cut off mid-navigation. |
+| `STREAM_GATE` | `off` | `token` enforces the stream gate: the desktop on 3000/3001 admits only requests carrying the token `POST /launch` mints. `off` admits everything. Defaults to `off` because released RomM cannot send that token yet, see [Security](#security). |
 
 ## API
 
@@ -214,7 +216,17 @@ Two credentials, guarding two different things.
 
 **`BROKER_SECRET` guards the API on port 8000.** Sent as `X-Broker-Secret`, compared in constant time. `GET /health` and `GET /verify` are deliberately exempt: `/health` so it works as a container healthcheck, `/verify` because nginx's `auth_request` cannot forward the secret and the stream token is itself the credential there.
 
-**The stream token guards the desktop on 3000/3001.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy — direct plain-HTTP browsing to it now fails closed.
+**The stream token guards the desktop on 3000/3001, when you turn it on.** It is minted per session by `POST /launch`, 256 bits from `secrets.token_urlsafe`, and enforced by an nginx `auth_request` that the mod injects into *every* `server` block in the site config. That matters: the base image ships two identical vhosts, plain HTTP on 3000 and TLS on 3001, both proxying the same selkies stream and both serving `/config/Desktop` at `/files`. Gating only the TLS one left a complete bypass a port number away. The `stream_sid` cookie is `Secure`, so 3000 is usable only behind a TLS-terminating proxy: direct plain-HTTP browsing to it fails closed.
+
+**The gate ships off, and that is a real hole.** With `STREAM_GATE=off`, anyone who can reach port 3000 or 3001 gets the interactive desktop with your ROM library browsable at `/files`, no credential asked for. It defaults to off because RomM cannot send the token yet. The streaming feature people are running is [rommapp/romm#3211](https://github.com/rommapp/romm/pull/3211), which is merged and hands the browser your configured `host` with nothing appended; the half that carries the token into the iframe URL is [rommapp/romm#3856](https://github.com/rommapp/romm/pull/3856), still open. Enforcing against a client that cannot comply is not a gate, it is a black stream: nginx refuses the document, every asset and the WebSocket upgrade alike, with nothing on screen to say why.
+
+So: keep the container on a network you trust until #3856 ships, then set `STREAM_GATE=token` and bring the container back up:
+
+```bash
+docker compose up -d pcsx2
+```
+
+Use `up -d`, not `restart`. Compose bakes the environment in at create time, so `docker compose restart` replays the old value and the gate silently stays off. The changed variable is enough on its own to recreate the container; no `--force-recreate` is needed, because enforcement is decided in the broker rather than in the nginx config, and the init re-injects the same gate on the fresh layer either way. Confirm it took: the broker names the mode in its startup log, and `GET /status` reports it as `stream_gate`.
 
 **Leaving `BROKER_SECRET` unset is a known hole, not a supported mode.** The broker runs as root inside the container, so the open API means root-privileged reads and writes under `/config`, plus arbitrary launches within `ROM_ROOT`. Worse, the two credentials stop being independent: `POST /launch` *returns* a stream token, so an unauthenticated broker hands out the credential that opens the desktop. Use it for local debugging on a trusted host and nothing else. The broker logs a warning at startup when it is unset.
 
@@ -250,9 +262,9 @@ The usual cause is the hardware encoder: Selkies routes `x264enc` through VAAPI 
 
 Confirm it took with `docker logs pcsx2 | grep -E "VAAPI|CPU Software"`. If it still cycles, drop to `SELKIES_ENCODER=jpeg` to skip H.264 entirely, at a real cost in bandwidth and sharpness.
 
-**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops, so the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines *at all* means the gate is not running: the mod's init never patched nginx. Check `docker logs pcsx2 | grep broker-mod` for the "Applied nginx stream gate to N vhost(s)" line, which should say 2.
+**"An error occurred, restarting stream", over and over.** The stream client says this whenever its WebSocket drops. First establish which mode is live: the startup line in `docker logs pcsx2` names it, and so does `stream_gate` in `GET /status`. Under `STREAM_GATE=off`, `/verify` admits every request with a `200`, and only 4xx and 5xx responses are logged, so no `/verify` lines at all is the expected healthy state there, not a fault. Under `STREAM_GATE=token`, the useful signal is on the broker side: `docker logs pcsx2 | grep "/verify"`. A `403` there names the reason (`no stream token in the request`, `stream token expired`, `stream token superseded by a newer launch`), and the token is redacted so the line is safe to share. No `/verify` lines at all while in `token` mode does mean the gate is not running: the mod's init never patched nginx. Check `docker logs pcsx2 | grep broker-mod` for the "Applied nginx stream gate to N vhost(s)" line, which should say 2; that check is valid in either mode, since the gate config is injected regardless of `STREAM_GATE`.
 
-**A stream that 403s on every asset over plain HTTP.** The `stream_sid` cookie is `Secure`, so a browser will not store it on an unencrypted origin. The query token admits the first request and everything after it is refused. Reach the container over TLS: either port 3001 directly, or port 3000 behind a reverse proxy that terminates TLS. Plain-HTTP 3000 straight to a browser is not a supported shape and now fails closed rather than serving an ungated desktop.
+**A stream that 403s on every asset over plain HTTP.** Only possible under `STREAM_GATE=token`, see [Security](#security): under `off` nothing 403s. The `stream_sid` cookie is `Secure`, so a browser will not store it on an unencrypted origin. The query token admits the first request and everything after it is refused. Reach the container over TLS: either port 3001 directly, or port 3000 behind a reverse proxy that terminates TLS. Plain-HTTP 3000 straight to a browser is not a supported shape in `token` mode.
 
 ## Development
 

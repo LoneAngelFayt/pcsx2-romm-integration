@@ -235,6 +235,29 @@ def _resolve_stream_gate(raw: str) -> str:
 
 STREAM_GATE = _resolve_stream_gate(os.environ.get("STREAM_GATE", STREAM_GATE_DEFAULT))
 
+
+def _log_stream_gate_mode() -> None:
+    """Announce stream gate enforcement at startup, in both directions.
+
+    The permissive case names what is exposed and how to close it, because an
+    operator should never have to deduce that the desktop is open. The
+    enforcing case says so too, so "is the gate actually on" is answerable
+    from `docker logs pcsx2` alone.
+    """
+    if STREAM_GATE == "token":
+        log.info(
+            "Stream gate enforced: the desktop admits only requests carrying "
+            "the stream token that POST /launch mints"
+        )
+        return
+    log.warning(
+        "STREAM_GATE=off, the stream gate is NOT enforced: anyone who can reach "
+        "port 3000 or 3001 gets the interactive desktop and the ROM library at "
+        "/files, with no credential. This is the default while RomM has no way "
+        "to send the token (rommapp/romm#3856). Set STREAM_GATE=token to close it."
+    )
+
+
 # Warn if the linuxserver init didn't export LD_PRELOAD. Gamepads silently
 # break when only the interposer is loaded without the fake libudev. Logged
 # here (after `log` exists) rather than at module import.
@@ -2303,6 +2326,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # Distinguishes a dead container from an idle dashboard.
                 "relaunch_abandoned": abandoned,
                 "stream_token": _live_stream_token() if active else None,
+                # Whether the nginx gate is actually being enforced. Reported
+                # because "is the desktop open right now" should be answerable
+                # remotely, and this endpoint is already behind BROKER_SECRET.
+                "stream_gate": STREAM_GATE,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -2634,6 +2661,7 @@ def main():
         log.info("Shared secret auth enabled")
     else:
         log.warning("BROKER_SECRET not set, all POST/DELETE endpoints are unauthenticated")
+    _log_stream_gate_mode()
 
     # Install a single handler for both SIGTERM (systemd stop) and SIGINT
     # (Ctrl-C). We intentionally don't use server.serve_forever()'s default
