@@ -2,6 +2,40 @@
 
 A [LinuxServer Docker Mod](https://docs.linuxserver.io/general/container-customization) that lets [RomM](https://github.com/rommapp/romm) drive [PCSX2](https://pcsx2.net/). Pick a PS2 game in the RomM web UI, and it boots in the PCSX2 container and streams back to your browser.
 
+## Migrating to webstation (v2)
+
+This mod is deprecated. RomM's emulator streaming is moving to a single [docker-webstation](https://github.com/linuxserver/docker-webstation) container running [romm-broker](https://github.com/romm-streaming/romm-broker), and support for a `config.yml` container without `protocol: webstation` (what this mod is) will eventually be removed from RomM. This mod keeps working as-is today, it just isn't getting new features going forward.
+
+Why: one container serving every platform instead of one per emulator, and one broker implementation instead of five slowly-drifting forks (this one, plus Dolphin, xemu, RPCS3, and Eden).
+
+Before, PS2 pinned to its own container:
+
+```yaml
+streaming:
+  containers:
+    - platform: ps2
+      host: "https://192.168.x.x:3001"
+      broker_host: "http://pcsx2:8000"
+      label: "PCSX2"
+      memory_card_sync: true
+```
+
+After, PS2 as one entry in a webstation container's platform map:
+
+```yaml
+streaming:
+  containers:
+    - host: "https://192.168.x.x:3010"
+      protocol: webstation
+      platforms:
+        ps2:
+          emulator: pcsx2
+          label: PCSX2
+          memory_card_sync: true
+```
+
+Save data, memory cards, and BIOS requirements don't change, only which container runs PCSX2. See RomM's `docs/STREAMING_MIGRATION.md` for the full guide: [rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md](https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md).
+
 ## What the broker actually is
 
 The mod drops a single Python file into the [linuxserver/pcsx2](https://docs.linuxserver.io/images/docker-pcsx2/) container and runs it as an s6 service. It is a small HTTP server, stdlib only, listening on port 8000. RomM talks to it; it talks to PCSX2.
